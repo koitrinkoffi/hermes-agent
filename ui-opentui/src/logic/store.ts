@@ -98,11 +98,19 @@ export interface SessionItem {
   messageCount: number
 }
 
-/** A row in a generic `<select>` picker (model picker, skills hub, …). */
+/** A row in the generic picker overlay (model picker, skills hub, …). */
 export interface PickerItem {
   label: string
   description?: string
   value: string
+  /** Group header this row renders under (e.g. the provider's display name).
+   *  Rows without a group render headerless (flat list). */
+  group?: string
+  /** Extra fuzzy-search haystacks beyond label/group/description (e.g. the
+   *  provider slug, so `oai` finds openai models). */
+  haystacks?: string[]
+  /** Marks the currently-active row (rendered with a ✓). */
+  current?: boolean
 }
 
 /** An open generic picker overlay: a titled list whose pick runs `onPick(value)`. */
@@ -194,6 +202,8 @@ export interface StoreState {
   subagents: SubagentInfo[]
   /** Whether the agents dashboard overlay is open (/agents). */
   dashboard: boolean
+  /** Subagent id the dashboard should preselect on open (tray Enter — Epic 2.7). */
+  dashboardAgent: string | undefined
   /** Transient busy indicator (the kaomoji face/verb from `thinking.delta`/`status.update`);
    *  shown above the composer WHILE a turn runs, cleared on `message.complete`. NOT transcript. */
   status: string | undefined
@@ -204,6 +214,11 @@ export interface StoreState {
   hint: string | undefined
   /** Startup tools/skills/MCP catalog (from `startup.catalog`) for the home panel (item 9). */
   catalog: Catalog | undefined
+  /** Cached `/model` picker rows (mapped `model.options`). Prefetched at session
+   *  bootstrap and refreshed after a switch, so `/model` opens INSTANTLY from
+   *  memory instead of awaiting the slow RPC (it does network calls: pricing
+   *  fetch + Nous tier check) on every open (Epic 7). */
+  modelItems: PickerItem[] | undefined
   /** The current session id (shown in the home panel; updated on create/resume). */
   sessionId: string | undefined
 }
@@ -348,10 +363,12 @@ export function createSessionStore() {
     completionFrom: 0,
     subagents: [],
     dashboard: false,
+    dashboardAgent: undefined,
     status: undefined,
     info: {},
     hint: undefined,
     catalog: undefined,
+    modelItems: undefined,
     sessionId: undefined
   })
 
@@ -475,12 +492,15 @@ export function createSessionStore() {
     applied.clear()
   }
 
-  /** Open / close the agents dashboard overlay (/agents). */
-  function openDashboard() {
+  /** Open / close the agents dashboard overlay (/agents). The optional `agentId`
+   *  preselects that subagent's row (the tray's Enter — Epic 2.7). */
+  function openDashboard(agentId?: string) {
+    setState('dashboardAgent', agentId)
     setState('dashboard', true)
   }
   function closeDashboard() {
     setState('dashboard', false)
+    setState('dashboardAgent', undefined)
   }
 
   /** Open a local Y/N confirm dialog (non-gateway; e.g. /clear). */
@@ -516,6 +536,11 @@ export function createSessionStore() {
   /** Close the generic picker. */
   function closePicker() {
     setState('picker', undefined)
+  }
+
+  /** Cache the mapped `/model` picker rows (instant open — Epic 7). */
+  function setModelItems(items: PickerItem[]) {
+    setState('modelItems', items)
   }
 
   /** Set / clear the transient composer hint ("Ctrl+C again to quit" — item 11). */
@@ -904,6 +929,7 @@ export function createSessionStore() {
     closeSwitcher,
     openPicker,
     closePicker,
+    setModelItems,
     setCompletions,
     clearCompletions,
     applyInfo,

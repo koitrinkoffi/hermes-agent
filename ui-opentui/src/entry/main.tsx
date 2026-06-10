@@ -36,7 +36,14 @@ import { envFlag } from '../logic/env.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
 import { createPasteStore } from '../logic/pastes.ts'
 import { mapResumeHistory, mapSessionList } from '../logic/resume.ts'
-import { dispatchSlash, mapCompletions, planCompletion, readReplaceFrom, type SlashContext } from '../logic/slash.ts'
+import {
+  dispatchSlash,
+  mapCompletions,
+  mapModelOptions,
+  planCompletion,
+  readReplaceFrom,
+  type SlashContext
+} from '../logic/slash.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
@@ -170,6 +177,17 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
       store.pushUser(prompt)
       yield* gateway.request('prompt.submit', { session_id: sid, text: prompt })
     }
+
+    // Prefetch the /model catalog (Epic 7 instant open): `model.options` is the
+    // slow RPC (it does network calls — pricing fetch + Nous tier check), so pay
+    // that cost ONCE here in this already-forked bootstrap fiber; `/model` then
+    // paints from memory on the same frame. Best-effort: if this hasn't landed
+    // (or the RPC is missing/old), /model falls back to fetching on first open.
+    const modelOpts = yield* gateway
+      .request<unknown>('model.options', { session_id: sid })
+      .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+    const modelItems = mapModelOptions(modelOpts)
+    if (modelItems.length) store.setModelItems(modelItems)
   }).pipe(Effect.catchCause(cause => Effect.sync(() => getLog().warn('bootstrap', 'failed', { cause: String(cause) }))))
 
 /** The entry Effect. Mirrors opencode `app.tsx:177` `run = Effect.fn("Tui.run")`. */
@@ -357,6 +375,8 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
           return true
         },
         listSessions: () => Effect.runPromise(gateway.request('session.list', {})).then(mapSessionList),
+        modelItems: () => store.state.modelItems,
+        setModelItems: items => store.setModelItems(items),
         logTail: () =>
           getLog()
             .tail(200)

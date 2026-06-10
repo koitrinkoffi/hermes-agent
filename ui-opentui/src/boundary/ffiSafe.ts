@@ -28,7 +28,7 @@
  * TODO(upstream): file/track an OpenTUI issue to widen these FFI params to i32
  * (or clamp in core) — then this shim can be deleted.
  */
-import { OptimizedBuffer } from '@opentui/core'
+import { OptimizedBuffer, TextBufferView } from '@opentui/core'
 
 let installed = false
 
@@ -83,5 +83,18 @@ export function installFfiCoordSafety(): void {
   proto.drawChar = function (this: OptimizedBuffer, char, x, y, ...rest) {
     if (x < 0 || y < 0) return
     origDrawChar.call(this, char, x, y, ...rest)
+  }
+
+  // Same u32 marshaling on a different entry point: `textBufferViewSetViewport`
+  // takes x/y/width/height as u32, but `TextRenderable.onResize` feeds it the
+  // RAW transient layout size — observed NON-u32 (negative/NaN) mid-relayout
+  // while a shrinking list (the fuzzy picker filtering rows away) reflows. Bun
+  // wraps/coerces, node:ffi throws (`Argument 3 must be a uint32`). Coerce into
+  // the valid quadrant; a zero-sized viewport is the native side's own no-op.
+  const u32 = (v: number) => (Number.isFinite(v) ? Math.max(0, Math.trunc(v)) : 0)
+  const viewProto = TextBufferView.prototype
+  const origSetViewport = viewProto.setViewport
+  viewProto.setViewport = function (this: TextBufferView, x, y, width, height) {
+    origSetViewport.call(this, u32(x), u32(y), u32(width), u32(height))
   }
 }

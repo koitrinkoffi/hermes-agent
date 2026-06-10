@@ -53,6 +53,10 @@ export interface SlashContext {
   readonly openPicker: (picker: PickerState) => void
   /** Open the agents dashboard (/agents, /tasks). */
   readonly openDashboard: () => void
+  /** Cached `/model` picker rows (Epic 7 instant open); undefined until prefetched. */
+  readonly modelItems: () => PickerItem[] | undefined
+  /** Update the cached `/model` picker rows. */
+  readonly setModelItems: (items: PickerItem[]) => void
 }
 
 function readStr(value: unknown, key: string): string | undefined {
@@ -153,26 +157,55 @@ const openSwitcher: ClientHandler = async (_arg, ctx) => {
   else ctx.pushSystem('No sessions to resume.')
 }
 
-/** Flatten `model.options` (authenticated providers' models) into picker rows; mark the current. */
-function mapModelOptions(opts: unknown): PickerItem[] {
+/**
+ * Flatten `model.options` (authenticated providers' models) into grouped picker
+ * rows (Epic 7): group = the provider's display ("lab") name, haystacks = slug +
+ * lab name (so `oai`/`anthropic` fuzzy-match models), value = the FULL switch
+ * arg `<model> --provider <slug>` so picking a model under a different provider
+ * actually switches provider+model (the gateway's `_apply_model_switch` parses
+ * `--provider` via parse_model_flags). The current model is flagged, not baked
+ * into the label, so the fuzzy scorer never matches the ✓.
+ */
+export function mapModelOptions(opts: unknown): PickerItem[] {
   if (!opts || typeof opts !== 'object') return []
   const providers = (opts as { providers?: unknown }).providers
   if (!Array.isArray(providers)) return []
   const current = readStr(opts, 'model')
+  const currentProvider = readStr(opts, 'provider')
   const items: PickerItem[] = []
   for (const p of providers) {
     if (!p || typeof p !== 'object' || (p as { authenticated?: unknown }).authenticated !== true) continue
     const slug = readStr(p, 'slug') ?? readStr(p, 'name') ?? ''
+    const lab = readStr(p, 'name') ?? slug
+    // The gateway's own normalized "this row is the active provider" flag —
+    // more reliable than comparing `provider` to `slug` (the agent's provider
+    // string can be the API dialect, e.g. an openai-compatible base_url).
+    const rowCurrent = (p as { is_current?: unknown }).is_current === true
     const models = (p as { models?: unknown }).models
     if (!Array.isArray(models)) continue
     for (const m of models) {
-      if (typeof m === 'string') items.push({ description: slug, label: m === current ? `${m} ✓` : m, value: m })
+      if (typeof m !== 'string') continue
+      const item: PickerItem = { label: m, value: slug ? `${m} --provider ${slug}` : m }
+      // current = same model id under the active provider (row flag first,
+      // then the slug comparison, then "no provider known at all").
+      if (m === current && (rowCurrent || currentProvider === slug || !currentProvider)) item.current = true
+      if (lab) item.group = lab
+      const haystacks = [slug, lab].filter(Boolean)
+      if (haystacks.length) item.haystacks = haystacks
+      items.push(item)
     }
+  }
+  // Provider matching failed entirely (string-normalization drift) but the
+  // model id is known → flag the first id match so the ✓ never just vanishes.
+  if (current && !items.some(i => i.current)) {
+    const fallback = items.find(i => i.label === current)
+    if (fallback) fallback.current = true
   }
   return items
 }
 
-/** Flatten `skills.manage {action:'list'}` ({skills: Record<category, names[]>}) into picker rows. */
+/** Flatten `skills.manage {action:'list'}` ({skills: Record<category, names[]>}) into
+ *  grouped picker rows (category = group header; also a fuzzy haystack). */
 function mapSkills(result: unknown): PickerItem[] {
   if (!result || typeof result !== 'object') return []
   const skills = (result as { skills?: unknown }).skills
@@ -180,33 +213,56 @@ function mapSkills(result: unknown): PickerItem[] {
   const items: PickerItem[] = []
   for (const [category, names] of Object.entries(skills as { [k: string]: unknown })) {
     if (!Array.isArray(names)) continue
-    for (const n of names) if (typeof n === 'string') items.push({ description: category, label: n, value: n })
+    for (const n of names) if (typeof n === 'string') items.push({ group: category, label: n, value: n })
   }
   return items
 }
 
-/** Switch the model via the server (shared by `/model <name>` and the picker pick). */
+/** Re-fetch `model.options` and update the cached picker rows (fire-and-forget). */
+function refreshModelItems(ctx: SlashContext): Promise<void> {
+  return ctx
+    .request('model.options', { session_id: ctx.sessionId() })
+    .then(opts => {
+      const items = mapModelOptions(opts)
+      if (items.length) ctx.setModelItems(items)
+    })
+    .catch(() => {})
+}
+
+/** Switch the model via the server (shared by `/model <name>` and the picker pick).
+ *  A successful switch refreshes the cached rows in the background (fresh ✓). */
 async function switchModel(ctx: SlashContext, name: string): Promise<void> {
   try {
     const r = await ctx.request('slash.exec', { command: `model ${name}`, session_id: ctx.sessionId() })
     ctx.pushSystem(readStr(r, 'output') || `→ ${name}`)
+    void refreshModelItems(ctx)
   } catch (error) {
     ctx.pushSystem(`/model ${name}: ${error instanceof Error ? error.message : 'switch failed'}`)
   }
 }
 
-/** `/model` — bare opens the model picker; `/model <name>` switches directly. */
+/** `/model` — bare opens the model picker; `/model <name>` switches directly.
+ *  Opens from the CACHED catalog when present — zero RPCs, same-frame paint
+ *  (Epic 7; the catalog is prefetched at bootstrap and refreshed on switch). */
 const modelCmd: ClientHandler = async (arg, ctx) => {
   if (arg.trim()) {
     await switchModel(ctx, arg.trim())
     return
   }
-  const items = mapModelOptions(await ctx.request('model.options', {}))
+  const open = (items: PickerItem[]) =>
+    ctx.openPicker({ items, onPick: name => void switchModel(ctx, name), title: 'Switch model' })
+  const cached = ctx.modelItems()
+  if (cached?.length) {
+    open(cached)
+    return
+  }
+  const items = mapModelOptions(await ctx.request('model.options', { session_id: ctx.sessionId() }))
   if (!items.length) {
     ctx.pushSystem('No models available (no authenticated providers).')
     return
   }
-  ctx.openPicker({ items, onPick: name => void switchModel(ctx, name), title: 'Switch model' })
+  ctx.setModelItems(items)
+  open(items)
 }
 
 /** `/skills` — open the skills hub; picking a skill shows its info in the pager. */

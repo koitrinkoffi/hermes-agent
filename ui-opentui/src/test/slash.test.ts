@@ -16,6 +16,22 @@ import type { PickerItem, SessionItem } from '../logic/store.ts'
 
 const FAKE_SESSIONS: SessionItem[] = [{ id: 's1', messageCount: 5, preview: 'hello there', title: 'First chat' }]
 
+/** A `model.options` payload: two authed providers + one unauthenticated. */
+const MODEL_OPTIONS = {
+  model: 'claude-sonnet-4.6',
+  provider: 'anthropic',
+  providers: [
+    {
+      authenticated: true,
+      models: ['claude-sonnet-4.6', 'claude-opus-4.6'],
+      name: 'Anthropic',
+      slug: 'anthropic'
+    },
+    { authenticated: true, models: ['hermes-4-405b'], name: 'Nous Research', slug: 'nous' },
+    { authenticated: false, models: ['gpt-5.4'], name: 'OpenAI', slug: 'openai' }
+  ]
+}
+
 describe('mapCompletions', () => {
   test('maps complete.slash items → candidates (display/meta default)', () => {
     expect(
@@ -97,6 +113,8 @@ interface Probe {
   dashboard: { value: boolean }
   copied: number[]
   copyN: { value: (n: number) => boolean }
+  /** The cached /model rows (Epic 7) — seed to simulate a prefetched catalog. */
+  modelCache: { value: PickerItem[] | undefined }
 }
 
 function makeCtx(request: (method: string, params: Record<string, unknown>) => Promise<unknown>): Probe {
@@ -112,6 +130,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const dashboard = { value: false }
   const copied: number[] = []
   const copyN: Probe['copyN'] = { value: () => false }
+  const modelCache: Probe['modelCache'] = { value: undefined }
   const ctx: SlashContext = {
     clearTranscript: () => (cleared.value = true),
     confirm: (message, onConfirm) => confirmed.push({ message, onConfirm }),
@@ -121,6 +140,8 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     },
     listSessions: () => Promise.resolve(FAKE_SESSIONS),
     logTail: () => ['gateway: spawned', 'bootstrap: session created'],
+    modelItems: () => modelCache.value,
+    setModelItems: items => (modelCache.value = items),
     openDashboard: () => (dashboard.value = true),
     openPager: (title, text) => paged.push({ text, title }),
     openPicker: p => pickers.push(p),
@@ -142,6 +163,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     copyN,
     ctx,
     dashboard,
+    modelCache,
     paged,
     pickers,
     quit,
@@ -185,33 +207,73 @@ describe('dispatchSlash — client commands', () => {
     expect(p2.switched).toHaveLength(1)
   })
 
-  test('/model (bare) opens a picker of authenticated providers’ models; pick switches', async () => {
+  test('/model (bare) opens a GROUPED picker of authenticated providers’ models; pick switches', async () => {
     const p = makeCtx(async method => {
-      if (method === 'model.options')
-        return {
-          model: 'claude-sonnet-4.6',
-          providers: [
-            {
-              authenticated: true,
-              models: ['claude-sonnet-4.6', 'claude-opus-4.6'],
-              name: 'Anthropic',
-              slug: 'anthropic'
-            },
-            { authenticated: false, models: ['gpt-5.4'], name: 'OpenAI', slug: 'openai' }
-          ]
-        }
+      if (method === 'model.options') return MODEL_OPTIONS
       return { output: 'switched' }
     })
     await dispatchSlash('/model', p.ctx)
     expect(p.pickers).toHaveLength(1)
     expect(p.pickers[0]!.title).toBe('Switch model')
-    // only the authenticated provider's models; current is marked
-    expect(p.pickers[0]!.items.map(i => i.value)).toEqual(['claude-sonnet-4.6', 'claude-opus-4.6'])
-    expect(p.pickers[0]!.items[0]!.label).toContain('✓')
-    // picking switches via slash.exec `model <name>`
-    p.pickers[0]!.onPick('claude-opus-4.6')
-    await Promise.resolve()
-    expect(p.calls.some(c => c.method === 'slash.exec' && c.params.command === 'model claude-opus-4.6')).toBe(true)
+    // only AUTHENTICATED providers' models; values carry the explicit provider so
+    // a pick under a different provider switches provider+model.
+    expect(p.pickers[0]!.items.map(i => i.value)).toEqual([
+      'claude-sonnet-4.6 --provider anthropic',
+      'claude-opus-4.6 --provider anthropic',
+      'hermes-4-405b --provider nous'
+    ])
+    // grouped by the provider's display (lab) name; slug+lab are fuzzy haystacks
+    expect(p.pickers[0]!.items.map(i => i.group)).toEqual(['Anthropic', 'Anthropic', 'Nous Research'])
+    expect(p.pickers[0]!.items[2]!.haystacks).toEqual(['nous', 'Nous Research'])
+    // current is FLAGGED (not baked into the label, so fuzzy never matches the ✓)
+    expect(p.pickers[0]!.items[0]!.current).toBe(true)
+    expect(p.pickers[0]!.items[0]!.label).toBe('claude-sonnet-4.6')
+    expect(p.pickers[0]!.items[1]!.current).toBeUndefined()
+    // picking switches via slash.exec `model <model> --provider <slug>`
+    p.pickers[0]!.onPick('claude-opus-4.6 --provider anthropic')
+    await new Promise(r => setTimeout(r, 0))
+    expect(
+      p.calls.some(c => c.method === 'slash.exec' && c.params.command === 'model claude-opus-4.6 --provider anthropic')
+    ).toBe(true)
+  })
+
+  test('/model with a CACHED catalog opens instantly — ZERO RPCs on open', async () => {
+    const p = makeCtx(async () => {
+      throw new Error('no RPC expected on open')
+    })
+    p.modelCache.value = [
+      {
+        group: 'Anthropic',
+        haystacks: ['anthropic', 'Anthropic'],
+        label: 'claude-sonnet-4.6',
+        value: 'claude-sonnet-4.6 --provider anthropic'
+      },
+      {
+        group: 'Nous Research',
+        haystacks: ['nous', 'Nous Research'],
+        label: 'hermes-4-405b',
+        value: 'hermes-4-405b --provider nous'
+      }
+    ]
+    await dispatchSlash('/model', p.ctx)
+    expect(p.pickers).toHaveLength(1)
+    expect(p.pickers[0]!.items).toHaveLength(2)
+    expect(p.calls).toHaveLength(0) // the whole point: open = memory, not network
+  })
+
+  test('/model uncached fetches ONCE, caches, and a pick refreshes the cache', async () => {
+    const p = makeCtx(async method => (method === 'model.options' ? MODEL_OPTIONS : { output: 'switched' }))
+    await dispatchSlash('/model', p.ctx)
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(1)
+    expect(p.modelCache.value).toHaveLength(3) // first open seeded the cache
+    // cross-provider pick: switch lands on the gateway, then a background
+    // refresh re-fetches model.options so the cached ✓ stays fresh.
+    p.pickers[0]!.onPick('hermes-4-405b --provider nous')
+    await new Promise(r => setTimeout(r, 0))
+    expect(
+      p.calls.some(c => c.method === 'slash.exec' && c.params.command === 'model hermes-4-405b --provider nous')
+    ).toBe(true)
+    expect(p.calls.filter(c => c.method === 'model.options')).toHaveLength(2)
   })
 
   test('/model <name> switches directly without opening the picker', async () => {
