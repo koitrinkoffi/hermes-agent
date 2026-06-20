@@ -298,6 +298,7 @@ jobs:
           HERMES_E2E_INSTALL_ROOT: ${{ env.HERMES_HOME }}\hermes-agent
 
       - name: Take final screenshot
+        if: always()
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.Windows.Forms
@@ -321,6 +322,7 @@ jobs:
           $bitmap.Dispose()
 
       - name: Upload screenshot artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshot

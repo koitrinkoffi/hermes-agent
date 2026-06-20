@@ -33,6 +33,7 @@ ClickWithMarker(x, y, button := "Left") {
     Click(x, y, button)
 
     Sleep(10)
+    MouseMove(30, 30)
     Log(Format("Clicking at {1}, {2}", x, y))
     size := 20
     g := Gui("-Caption +AlwaysOnTop +ToolWindow")
@@ -88,7 +89,7 @@ ClickCenterOfImageInWindow(winTitle, imageFile, timeoutMs := 10000, intervalMs :
 
         Sleep intervalMs
         timeLeft := timeoutMs - (A_TickCount - startTime)
-        Log(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, Round(timeLeft / 1000, 2)))
+        ToolTip(Format("Searching for button {} in window {}...  {}s left", imageFile, winTitle, Round(timeLeft / 1000, 2)))
     }
 
     throw Error(Format("Failed to find button {} in window {}", imageFile, winTitle))
@@ -107,7 +108,7 @@ Log(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h))
 
 ClickCenterOfImageInWindow(winTitle, "install-button.png")
 
-ClickCenterOfImageInWindow(winTitle, "install-button.png", 1000 * 60 * 10)
+ClickCenterOfImageInWindow(winTitle, "install-button.png", 1000 * 60 * 8)
 
 
 ; done
