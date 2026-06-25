@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 
 
 from tools.browser_camofox import (
+    _auth_headers,
+    _rewrite_loopback_url_for_camofox,
     camofox_back,
     camofox_click,
     camofox_close,
@@ -18,7 +20,6 @@ from tools.browser_camofox import (
     camofox_vision,
     check_camofox_available,
     is_camofox_mode,
-    _rewrite_loopback_url_for_camofox,
 )
 
 
@@ -36,6 +37,18 @@ class TestCamofoxMode:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         assert is_camofox_mode() is True
 
+
+class TestCamofoxAuthHeaders:
+    def test_auth_headers_empty_without_api_key(self, monkeypatch):
+        monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
+        assert _auth_headers() == {}
+
+    def test_auth_headers_use_bearer_token(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_API_KEY", "secret-token")
+        assert _auth_headers() == {"Authorization": "Bearer secret-token"}
+
+
+class TestCamofoxModeOverrides:
     def test_cdp_override_takes_priority(self, monkeypatch):
         """When BROWSER_CDP_URL is set (via /browser connect), CDP takes priority over Camofox."""
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
@@ -268,6 +281,17 @@ class TestCamofoxInteractions:
         result = json.loads(camofox_press("Enter", task_id="t8"))
         assert result["success"] is True
         assert result["pressed"] == "Enter"
+
+    @patch("tools.browser_camofox.requests.post")
+    def test_create_tab_sends_auth_header_when_api_key_present(self, mock_post, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_API_KEY", "secret-token")
+        mock_post.return_value = _mock_response(json_data={"tabId": "tab_auth", "url": "https://x.com"})
+
+        result = json.loads(camofox_navigate("https://x.com", task_id="t_auth"))
+
+        assert result["success"] is True
+        assert mock_post.call_args.kwargs["headers"] == {"Authorization": "Bearer secret-token"}
 
 
 # ---------------------------------------------------------------------------

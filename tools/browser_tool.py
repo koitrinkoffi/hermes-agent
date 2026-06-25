@@ -1634,6 +1634,71 @@ BROWSER_TOOL_SCHEMAS = [
             "required": []
         }
     },
+    {
+        "name": "browser_tab",
+        "description": "Manage browser tabs. Supports creating a new tab, listing open tabs, switching to a tab by 1-based index, or closing a tab. When no index is provided for close, closes the active tab. Requires browser_navigate to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["new", "list", "switch", "close"],
+                    "description": "Tab action to perform"
+                },
+                "index": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based tab index for switch or close"
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Optional URL to open when creating a new tab"
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "browser_upload",
+        "description": "Upload one or more local files through a file input element identified by its ref ID. Accepts either a single path or multiple paths. Requires browser_navigate and browser_snapshot to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The file input element reference from the snapshot (e.g., '@e3')"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Single local file path to upload"
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Multiple local file paths to upload"
+                }
+            },
+            "required": ["ref"]
+        }
+    },
+    {
+        "name": "browser_download",
+        "description": "Download a file by clicking an element identified by its ref ID. If no path is provided, Hermes saves it to a persistent default downloads directory and returns the absolute path. Requires browser_navigate and browser_snapshot to be called first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The element reference from the snapshot (e.g., '@e5', '@e12')"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional destination file path. If omitted, Hermes chooses a persistent default path."
+                }
+            },
+            "required": ["ref"]
+        }
+    },
 ]
 
 
@@ -2978,6 +3043,438 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         return tool_error(error_msg, success=False)
 
 
+def _browser_tool_unsupported_in_camofox(tool_name: str) -> str:
+    """Return a consistent unsupported error for tools missing on Camofox."""
+    return json.dumps({
+        "success": False,
+        "error": (
+            f"{tool_name} is not supported by the configured Camofox browser backend. "
+            "Use the standard agent-browser backend or a CDP-connected browser for this operation."
+        ),
+    }, ensure_ascii=False)
+
+
+def _normalize_ref(ref: str) -> str:
+    """Ensure browser refs use the @eN form expected by the browser backends."""
+    return ref if ref.startswith("@") else f"@{ref}"
+
+
+def _normalize_upload_target(target: str) -> str:
+    """Accept either an @eN ref or a raw selector for browser_upload."""
+    stripped = (target or "").strip()
+    if not stripped:
+        return stripped
+    if stripped.startswith("@"):
+        return stripped
+    if re.fullmatch(r"e\d+", stripped):
+        return f"@{stripped}"
+    return stripped
+
+
+def _normalize_upload_paths(path: Optional[str] = None, paths: Optional[List[str]] = None) -> tuple[list[str], Optional[str]]:
+    """Validate and normalize upload file paths."""
+    raw_paths: list[str] = []
+    if path:
+        raw_paths.append(path)
+    if paths:
+        raw_paths.extend(paths)
+
+    if not raw_paths:
+        return [], "No files provided. Pass 'path' or 'paths'."
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            return [], "Invalid file path: empty path entries are not allowed."
+        candidate = str(Path(raw).expanduser().resolve())
+        if not os.path.exists(candidate):
+            return [], f"Upload file not found: {candidate}"
+        if not os.path.isfile(candidate):
+            return [], f"Upload path is not a file: {candidate}"
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+
+    if not normalized:
+        return [], "No valid files provided for upload."
+    return normalized, None
+
+
+def _default_browser_download_path() -> Path:
+    """Return a persistent default file path for browser downloads."""
+    import uuid
+
+    downloads_dir = get_hermes_home() / "browser_downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    return downloads_dir / f"download_{int(time.time())}_{uuid.uuid4().hex[:8]}.bin"
+
+
+def _normalize_download_path(path: Optional[str]) -> Path:
+    """Resolve an explicit or default download destination to an absolute path."""
+    target = Path(path).expanduser() if path else _default_browser_download_path()
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    target = target.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _normalize_tab_payload(data: Any) -> tuple[list[dict[str, Any]], Optional[int]]:
+    """Normalize browser tab listings to a stable Hermes shape."""
+    active_index: Optional[int] = None
+    raw_tabs: Any = data
+    if isinstance(data, dict):
+        raw_tabs = data.get("tabs")
+        if raw_tabs is None:
+            for key in ("data", "items", "list"):
+                if isinstance(data.get(key), list):
+                    raw_tabs = data[key]
+                    break
+        active_index = data.get("active_index") or data.get("activeIndex")
+
+    if not isinstance(raw_tabs, list):
+        raw_tabs = []
+
+    tabs: list[dict[str, Any]] = []
+    for pos, item in enumerate(raw_tabs, start=1):
+        if isinstance(item, dict):
+            entry = {
+                "index": pos,
+                "title": item.get("title") or item.get("name") or "",
+                "url": item.get("url") or item.get("href") or "",
+                "active": bool(item.get("active") or item.get("current") or item.get("selected")),
+            }
+        else:
+            entry = {
+                "index": pos,
+                "title": str(item),
+                "url": "",
+                "active": False,
+            }
+        tabs.append(entry)
+        if entry["active"]:
+            active_index = entry["index"]
+
+    if active_index is None:
+        for entry in tabs:
+            if entry["active"]:
+                active_index = entry["index"]
+                break
+
+    if active_index is not None:
+        try:
+            active_index = int(active_index)
+        except (TypeError, ValueError):
+            active_index = None
+
+    return tabs, active_index
+
+
+def _camofox_tab_list(task_id: Optional[str]) -> tuple[list[dict[str, Any]], Optional[int], dict[str, Any]]:
+    """Return normalized Camofox tabs plus active index and session info."""
+    from tools.browser_camofox import _get, _get_session
+
+    session = _get_session(task_id or "default")
+    data = _get("/tabs", params={"userId": session["user_id"]})
+    raw_tabs = data.get("tabs", []) if isinstance(data, dict) else []
+
+    tabs: list[dict[str, Any]] = []
+    active_index: Optional[int] = None
+    active_tab_id = session.get("tab_id")
+    for pos, item in enumerate(raw_tabs, start=1):
+        tab_id = item.get("tabId") if isinstance(item, dict) else None
+        is_active = bool(active_tab_id and tab_id == active_tab_id)
+        tabs.append({
+            "index": pos,
+            "title": item.get("title", "") if isinstance(item, dict) else str(item),
+            "url": item.get("url", "") if isinstance(item, dict) else "",
+            "active": is_active,
+            "tab_id": tab_id,
+        })
+        if is_active:
+            active_index = pos
+
+    return tabs, active_index, session
+
+
+def _default_browser_download_dir() -> Path:
+    downloads_dir = get_hermes_home() / "browser_downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    return downloads_dir
+
+
+def _choose_download_target(path: Optional[str], suggested_filename: Optional[str] = None) -> Path:
+    if path:
+        return _normalize_download_path(path)
+    filename = (suggested_filename or "download.bin").strip() or "download.bin"
+    filename = filename.replace("/", "_").replace("\\", "_")
+    target = _default_browser_download_dir() / filename
+    if not target.exists():
+        return target.resolve()
+    stem = target.stem
+    suffix = target.suffix
+    for i in range(1, 1000):
+        candidate = target.with_name(f"{stem}_{i}{suffix}")
+        if not candidate.exists():
+            return candidate.resolve()
+    return _normalize_download_path(None)
+
+
+def _camofox_browser_tab(action: str, index: Optional[int], url: Optional[str], task_id: Optional[str]) -> str:
+    from tools.browser_camofox import _delete, _get_session, _post
+
+    validated_index = int(index) if index is not None else None
+    if action == "list":
+        tabs, active_index, _session = _camofox_tab_list(task_id)
+        for tab in tabs:
+            tab.pop("tab_id", None)
+        return json.dumps({"success": True, "tabs": tabs, "active_index": active_index}, ensure_ascii=False)
+
+    session = _get_session(task_id or "default")
+
+    if action == "new":
+        data = _post(
+            "/tabs",
+            {
+                "userId": session["user_id"],
+                "sessionKey": session["session_key"],
+                "url": url or "about:blank",
+            },
+            timeout=max(_get_command_timeout(), 60),
+        )
+        if isinstance(data, dict) and data.get("tabId"):
+            session["tab_id"] = data["tabId"]
+        response = {"success": True, "action": "new"}
+        if url:
+            response["url"] = url
+        return json.dumps(response, ensure_ascii=False)
+
+    tabs, active_index, session = _camofox_tab_list(task_id)
+    if action == "switch":
+        if validated_index is None or validated_index < 1 or validated_index > len(tabs):
+            return json.dumps({"success": False, "error": "Tab index out of range."}, ensure_ascii=False)
+        session["tab_id"] = tabs[validated_index - 1].get("tab_id")
+        return json.dumps({"success": True, "action": "switch", "active_index": validated_index}, ensure_ascii=False)
+
+    target_tab = None
+    if validated_index is not None:
+        if validated_index < 1 or validated_index > len(tabs):
+            return json.dumps({"success": False, "error": "Tab index out of range."}, ensure_ascii=False)
+        target_tab = tabs[validated_index - 1]
+    else:
+        target_tab = next((tab for tab in tabs if tab.get("active")), tabs[-1] if tabs else None)
+
+    if not target_tab or not target_tab.get("tab_id"):
+        return json.dumps({"success": False, "error": "No tab available to close."}, ensure_ascii=False)
+
+    _delete(f"/tabs/{target_tab['tab_id']}", body={"userId": session["user_id"]}, timeout=max(_get_command_timeout(), 60))
+    remaining_tabs, remaining_active_index, session = _camofox_tab_list(task_id)
+    if session.get("tab_id") == target_tab.get("tab_id"):
+        session["tab_id"] = remaining_tabs[-1].get("tab_id") if remaining_tabs else None
+        for pos, item in enumerate(remaining_tabs, start=1):
+            item["active"] = item.get("tab_id") == session.get("tab_id")
+            if item["active"]:
+                remaining_active_index = pos
+
+    response = {"success": True, "action": "close"}
+    if validated_index is not None:
+        response["closed_index"] = validated_index
+    else:
+        response["closed_active"] = True
+    response["active_index"] = remaining_active_index
+    return json.dumps(response, ensure_ascii=False)
+
+
+def _camofox_browser_download(ref: str, path: Optional[str], task_id: Optional[str]) -> str:
+    import base64
+    from tools.browser_camofox import _ensure_tab, _get, _post
+
+    session = _ensure_tab(task_id or "default")
+    tab_id = session.get("tab_id")
+    normalized_ref = _normalize_ref(ref).lstrip("@")
+
+    _post(
+        f"/tabs/{tab_id}/click",
+        {"userId": session["user_id"], "ref": normalized_ref},
+        timeout=max(_get_command_timeout(), 60),
+    )
+
+    deadline = time.time() + 20
+    last_downloads: list[dict[str, Any]] = []
+    while time.time() < deadline:
+        data = _get(
+            f"/tabs/{tab_id}/downloads",
+            params={"userId": session["user_id"], "includeData": "true", "consume": "true"},
+            timeout=max(_get_command_timeout(), 60),
+        )
+        last_downloads = data.get("downloads", []) if isinstance(data, dict) else []
+        if last_downloads:
+            break
+        time.sleep(0.5)
+
+    if not last_downloads:
+        return json.dumps({"success": False, "error": "No download was captured after clicking the target element."}, ensure_ascii=False)
+
+    first = last_downloads[0]
+    if first.get("failure"):
+        return json.dumps({"success": False, "error": f"Download failed: {first['failure']}"}, ensure_ascii=False)
+    raw_b64 = first.get("dataBase64")
+    if not raw_b64:
+        return json.dumps({
+            "success": False,
+            "error": "Download metadata was captured, but file bytes were unavailable from Camofox.",
+            "downloads": last_downloads,
+        }, ensure_ascii=False)
+
+    target_path = _choose_download_target(path, first.get("suggestedFilename"))
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(base64.b64decode(raw_b64))
+    return json.dumps({
+        "success": True,
+        "path": str(target_path),
+        "exists": True,
+        "element": _normalize_ref(ref),
+    }, ensure_ascii=False)
+
+
+def browser_tab(action: str, index: Optional[int] = None, url: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """Manage browser tabs using a single multiplexed tool."""
+    if _is_camofox_mode():
+        return _camofox_browser_tab(action=action, index=index, url=url, task_id=task_id)
+
+    action = (action or "").strip().lower()
+    if action not in {"new", "list", "switch", "close"}:
+        return json.dumps({"success": False, "error": f"Invalid action '{action}'."}, ensure_ascii=False)
+
+    validated_index: Optional[int] = None
+    if index is not None:
+        validated_index = int(index)
+    if action == "switch" and (validated_index is None or validated_index < 1):
+        return json.dumps({"success": False, "error": "browser_tab(action='switch') requires a 1-based index."}, ensure_ascii=False)
+    if action == "close" and validated_index is not None and validated_index < 1:
+        return json.dumps({"success": False, "error": "browser_tab(action='close') index must be >= 1."}, ensure_ascii=False)
+
+    effective_task_id = _last_session_key(task_id or "default")
+
+    if action == "list":
+        result = _run_browser_command(effective_task_id, "tab", ["list"])
+        if not result.get("success"):
+            response = {"success": False, "error": result.get("error", "Failed to list tabs")}
+            return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+        tabs, active_index = _normalize_tab_payload(result.get("data", {}))
+        response = {"success": True, "tabs": tabs, "active_index": active_index}
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+    if action == "new":
+        create_result = _run_browser_command(effective_task_id, "tab", ["new"])
+        if not create_result.get("success"):
+            response = {"success": False, "error": create_result.get("error", "Failed to create new tab")}
+            return json.dumps(_copy_fallback_warning(response, create_result), ensure_ascii=False)
+        if url:
+            nav_result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
+            if not nav_result.get("success"):
+                response = {"success": False, "error": nav_result.get("error", f"Failed to navigate new tab to {url}")}
+                return json.dumps(_copy_fallback_warning(response, nav_result), ensure_ascii=False)
+            response = {"success": True, "action": "new", "url": url}
+            return json.dumps(_copy_fallback_warning(response, nav_result), ensure_ascii=False)
+        response = {"success": True, "action": "new"}
+        return json.dumps(_copy_fallback_warning(response, create_result), ensure_ascii=False)
+
+    if action == "switch":
+        result = _run_browser_command(effective_task_id, "tab", [str(validated_index)])
+        if not result.get("success"):
+            response = {"success": False, "error": result.get("error", f"Failed to switch to tab {validated_index}")}
+            return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+        response = {"success": True, "action": "switch", "active_index": validated_index}
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+    close_args = ["close"]
+    if validated_index is not None:
+        close_args.append(str(validated_index))
+    result = _run_browser_command(effective_task_id, "tab", close_args)
+    if not result.get("success"):
+        response = {"success": False, "error": result.get("error", "Failed to close tab")}
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+    response = {"success": True, "action": "close"}
+    if validated_index is not None:
+        response["closed_index"] = validated_index
+    else:
+        response["closed_active"] = True
+    return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+def browser_upload(ref: str, path: Optional[str] = None, paths: Optional[List[str]] = None, task_id: Optional[str] = None) -> str:
+    """Upload one or more local files via a file input element."""
+    if _is_camofox_mode():
+        return _browser_tool_unsupported_in_camofox("browser_upload")
+
+    normalized_paths, error = _normalize_upload_paths(path=path, paths=paths)
+    if error:
+        return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+
+    effective_task_id = _last_session_key(task_id or "default")
+    normalized_target = _normalize_upload_target(ref)
+    result = _run_browser_command(
+        effective_task_id,
+        "upload",
+        [normalized_target, *normalized_paths],
+        timeout=max(_get_command_timeout(), 60),
+    )
+
+    if result.get("success"):
+        response = {
+            "success": True,
+            "element": normalized_target,
+            "uploaded_paths": normalized_paths,
+        }
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+    response = {
+        "success": False,
+        "error": result.get("error", f"Failed to upload files to {normalized_target}"),
+    }
+    return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """Download a file by clicking an element and saving it locally."""
+    if _is_camofox_mode():
+        return _camofox_browser_download(ref=ref, path=path, task_id=task_id)
+
+    effective_task_id = _last_session_key(task_id or "default")
+    normalized_ref = _normalize_ref(ref)
+    target_path = _normalize_download_path(path)
+
+    result = _run_browser_command(
+        effective_task_id,
+        "download",
+        [normalized_ref, str(target_path)],
+        timeout=max(_get_command_timeout(), 60),
+    )
+
+    if not result.get("success"):
+        response = {"success": False, "error": result.get("error", f"Failed to download from {normalized_ref}")}
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+    if not target_path.exists() or not target_path.is_file():
+        response = {
+            "success": False,
+            "error": f"Download reported success but file was not found at {target_path}",
+            "path": str(target_path),
+        }
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+    response = {
+        "success": True,
+        "path": str(target_path),
+        "exists": True,
+        "element": normalized_ref,
+    }
+    return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
 def _maybe_start_recording(task_id: str):
     """Start recording if browser.record_sessions is enabled in config."""
     with _cleanup_lock:
@@ -3574,9 +4071,10 @@ def _chromium_search_roots() -> List[str]:
 
     1. ``PLAYWRIGHT_BROWSERS_PATH`` when set (Docker image sets this to
        ``/opt/hermes/.playwright``).
-    2. ``~/.cache/ms-playwright`` — Playwright's default on Linux/macOS.
-    3. ``~/Library/Caches/ms-playwright`` — Playwright's default on macOS.
-    4. ``%USERPROFILE%\\AppData\\Local\\ms-playwright`` — Playwright's default
+    2. ``~/.agent-browser/browsers`` — agent-browser's Chrome-for-Testing cache.
+    3. ``~/.cache/ms-playwright`` — Playwright's default on Linux/macOS.
+    4. ``~/Library/Caches/ms-playwright`` — Playwright's default on macOS.
+    5. ``%USERPROFILE%\\AppData\\Local\\ms-playwright`` — Playwright's default
        on Windows.
     """
     roots: List[str] = []
@@ -3584,6 +4082,7 @@ def _chromium_search_roots() -> List[str]:
     if env_path and env_path != "0":
         roots.append(env_path)
     home = os.path.expanduser("~")
+    roots.append(os.path.join(home, ".agent-browser", "browsers"))
     roots.append(os.path.join(home, ".cache", "ms-playwright"))
     if sys.platform == "darwin":
         roots.append(os.path.join(home, "Library", "Caches", "ms-playwright"))
@@ -3645,10 +4144,13 @@ def _chromium_installed() -> bool:
         except OSError:
             continue
         # Playwright names them ``chromium-<build>`` and
-        # ``chromium_headless_shell-<build>``; agent-browser accepts either.
+        # ``chromium_headless_shell-<build>``; agent-browser's own installer
+        # stores Chrome-for-Testing builds as ``chrome-<version>``.
         for entry in entries:
-            if entry.startswith("chromium-") or entry.startswith(
-                "chromium_headless_shell-"
+            if (
+                entry.startswith("chromium-")
+                or entry.startswith("chromium_headless_shell-")
+                or entry.startswith("chrome-")
             ):
                 _cached_chromium_installed = True
                 return True
@@ -3888,4 +4390,42 @@ registry.register(
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+)
+registry.register(
+    name="browser_tab",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_tab"],
+    handler=lambda args, **kw: browser_tab(
+        action=args.get("action", ""),
+        index=args.get("index"),
+        url=args.get("url"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🗂️",
+)
+registry.register(
+    name="browser_upload",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_upload"],
+    handler=lambda args, **kw: browser_upload(
+        ref=args.get("ref", ""),
+        path=args.get("path"),
+        paths=args.get("paths"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📤",
+)
+registry.register(
+    name="browser_download",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_download"],
+    handler=lambda args, **kw: browser_download(
+        ref=args.get("ref", ""),
+        path=args.get("path"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📥",
 )
