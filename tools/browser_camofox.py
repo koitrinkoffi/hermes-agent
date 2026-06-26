@@ -629,6 +629,39 @@ def camofox_upload(target: str, paths: list, task_id: Optional[str] = None) -> s
         return tool_error(str(e), success=False)
 
 
+def camofox_dropzone_upload(selector: str, paths: list, task_id: Optional[str] = None) -> str:
+    """Attach local files to a Dropzone.js-style drag-drop uploader via Camofox.
+
+    For widgets where a plain file input isn't reachable (Dropzone, etc.). The
+    server tries the native file chooser, hidden-input setInputFiles, and a
+    synthetic drop (file injected via the evaluate-arg channel), verifying an
+    actual upload signal and reporting which strategy worked.
+    """
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+
+        body: Dict[str, Any] = {
+            "userId": session["user_id"],
+            "selector": (selector or ".dropzone").strip() or ".dropzone",
+            "paths": list(paths),
+        }
+        data = _post(
+            f"/tabs/{session['tab_id']}/dropzone-upload",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 90),
+        )
+        return json.dumps({
+            "success": True,
+            "selector": body["selector"],
+            "uploaded_paths": list(paths),
+            "strategy": data.get("strategy") if isinstance(data, dict) else None,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
     """Scroll the page via Camofox."""
     try:

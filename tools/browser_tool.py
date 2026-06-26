@@ -1791,6 +1791,29 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_dropzone_upload",
+        "description": "Attach one or more local files to a drag-and-drop uploader (Dropzone.js and similar 'drop files here' zones) where browser_upload fails because the file input is hidden/JS-managed. Provide the dropzone element's CSS selector. Requires browser_navigate first. Camofox backend only.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector of the dropzone element (default '.dropzone')"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Single local file path to upload"
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Multiple local file paths to upload"
+                }
+            },
+            "required": []
+        }
+    },
+    {
         "name": "browser_download",
         "description": "Download a file by clicking an element identified by its ref ID. If no path is provided, Hermes saves it to a persistent default downloads directory and returns the absolute path. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
@@ -3570,6 +3593,30 @@ def browser_upload(ref: str, path: Optional[str] = None, paths: Optional[List[st
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
+def browser_dropzone_upload(selector: Optional[str] = None, path: Optional[str] = None,
+                            paths: Optional[List[str]] = None, task_id: Optional[str] = None) -> str:
+    """Attach local files to a drag-and-drop uploader (Dropzone.js and similar).
+
+    Use this instead of browser_upload when the target is a "drop files here"
+    zone with no usable file input (the file input is hidden/managed by JS).
+    ``selector`` is the dropzone element selector (default ``.dropzone``).
+    """
+    normalized_paths, error = _normalize_upload_paths(path=path, paths=paths)
+    if error:
+        return json.dumps({"success": False, "error": error}, ensure_ascii=False)
+
+    drop_selector = (selector or ".dropzone").strip() or ".dropzone"
+
+    if _is_camofox_mode():
+        from tools.browser_camofox import camofox_dropzone_upload
+        return camofox_dropzone_upload(drop_selector, normalized_paths, task_id=task_id)
+
+    return json.dumps({
+        "success": False,
+        "error": "browser_dropzone_upload requires the Camofox browser backend.",
+    }, ensure_ascii=False)
+
+
 def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str] = None) -> str:
     """Download a file by clicking an element and saving it locally."""
     if _is_camofox_mode():
@@ -4542,6 +4589,19 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_upload"],
     handler=lambda args, **kw: browser_upload(
         ref=args.get("ref", ""),
+        path=args.get("path"),
+        paths=args.get("paths"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📤",
+)
+registry.register(
+    name="browser_dropzone_upload",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_dropzone_upload"],
+    handler=lambda args, **kw: browser_dropzone_upload(
+        selector=args.get("selector"),
         path=args.get("path"),
         paths=args.get("paths"),
         task_id=kw.get("task_id"),
