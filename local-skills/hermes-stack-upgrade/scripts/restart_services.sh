@@ -15,6 +15,9 @@ restart() {
 
 restart camofox.service
 restart hermes-gateway.service
+# The dashboard is a separate long-lived process; it caches the tool registry at
+# startup, so it must restart too or newly added tools won't appear in the UI.
+restart hermes-dashboard.service
 
 # Give camofox a moment, then health-check it.
 sleep 2
