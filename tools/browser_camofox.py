@@ -580,6 +580,40 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         return tool_error(str(e), success=False)
 
 
+def camofox_upload(target: str, paths: list, task_id: Optional[str] = None) -> str:
+    """Upload local files to a file input via Camofox.
+
+    ``target`` is an already-normalized upload target (an ``@eN`` ref or a raw
+    CSS selector, per ``_normalize_upload_target``). Paths are sent as-is; the
+    Camofox server reads them off the shared local filesystem.
+    """
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+
+        body: Dict[str, Any] = {"userId": session["user_id"], "paths": list(paths)}
+        clean = (target or "").strip()
+        # _normalize_upload_target always prefixes refs with "@"; anything else is a selector.
+        if clean.startswith("@"):
+            body["ref"] = clean.lstrip("@")
+        else:
+            body["selector"] = clean
+
+        _post(
+            f"/tabs/{session['tab_id']}/upload",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 60),
+        )
+        return json.dumps({
+            "success": True,
+            "element": target,
+            "uploaded_paths": list(paths),
+        }, ensure_ascii=False)
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
     """Scroll the page via Camofox."""
     try:

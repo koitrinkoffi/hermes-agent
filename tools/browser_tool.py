@@ -3407,15 +3407,19 @@ def browser_tab(action: str, index: Optional[int] = None, url: Optional[str] = N
 
 def browser_upload(ref: str, path: Optional[str] = None, paths: Optional[List[str]] = None, task_id: Optional[str] = None) -> str:
     """Upload one or more local files via a file input element."""
-    if _is_camofox_mode():
-        return _browser_tool_unsupported_in_camofox("browser_upload")
-
+    # Validate paths/target before dispatching so both backends share identical
+    # validation and the LLM-facing response shape is backend-independent.
     normalized_paths, error = _normalize_upload_paths(path=path, paths=paths)
     if error:
         return json.dumps({"success": False, "error": error}, ensure_ascii=False)
 
-    effective_task_id = _last_session_key(task_id or "default")
     normalized_target = _normalize_upload_target(ref)
+
+    if _is_camofox_mode():
+        from tools.browser_camofox import camofox_upload
+        return camofox_upload(normalized_target, normalized_paths, task_id=task_id)
+
+    effective_task_id = _last_session_key(task_id or "default")
     result = _run_browser_command(
         effective_task_id,
         "upload",
