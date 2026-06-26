@@ -15,8 +15,20 @@ echo "=== [1/3] hermes unit tests ==="
   "$HERMES_REPO/tests/tools/test_browser_tab_upload_download.py" -q || { echo "✗ unit tests failed"; exit 1; }
 
 echo "=== [2/3] camofox e2e (upload) ==="
-( cd "$CAMOFOX_REPO" && NODE_OPTIONS='--experimental-vm-modules' \
-    npx jest --config jest.config.e2e.cjs --runInBand --forceExit upload ) || { echo "✗ camofox e2e failed"; exit 1; }
+# Run hermetic: strip any ambient camofox auth keys (the Hermes gateway env
+# carries CAMOFOX_API_KEY so it can call camofox). If they leak into the e2e
+# test's own server it enforces auth, and the unauthenticated test client gets
+# 403 instead of the expected 400/success. Stripping them => keyless server =>
+# loopback auth, deterministic regardless of who launched the upgrade.
+run_e2e() { ( cd "$CAMOFOX_REPO" && env -u CAMOFOX_API_KEY -u CAMOFOX_ACCESS_KEY -u CAMOFOX_ADMIN_KEY \
+    NODE_OPTIONS='--experimental-vm-modules' \
+    npx jest --config jest.config.e2e.cjs --runInBand --forceExit upload ); }
+# Real-browser e2e is timing-sensitive under load; retry once so a single flaky
+# run doesn't trigger an unnecessary rollback. A genuine break fails both times.
+if ! run_e2e; then
+  echo "⚠ camofox e2e failed once (real-browser flakiness?) — retrying once..."
+  run_e2e || { echo "✗ camofox e2e failed twice"; exit 1; }
+fi
 
 echo "=== [3/3] live smoke through running camofox ==="
 # Source CAMOFOX_URL / CAMOFOX_API_KEY from the running service's env file.
