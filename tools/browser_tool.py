@@ -1674,6 +1674,48 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_drag",
+        "description": (
+            "Perform a real mouse drag (press -> move -> release) for drag-and-drop, "
+            "sliders, and CAPTCHAs (slider/puzzle), or canvas widgets where clicking/typing "
+            "isn't enough. Give a START and an END point, each EITHER as a snapshot ref "
+            "(from_ref/to_ref, e.g. '@e5'), a CSS selector (from_selector/to_selector, dragged "
+            "from/to the element center), OR absolute viewport pixel coordinates "
+            "(from_x/from_y, to_x/to_y — get these from element rects via browser_console "
+            "getBoundingClientRect when targets have no ref, e.g. a timeline/canvas cell). "
+            "Optional 'waypoints' (list of {x,y}) define an explicit path between press and "
+            "release for curved slider captchas; 'humanize' adds eased motion with slight jitter. "
+            "Requires browser_navigate first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "from_ref": {"type": "string", "description": "Start element ref from the snapshot (e.g. '@e5')."},
+                "to_ref": {"type": "string", "description": "End/drop element ref from the snapshot (e.g. '@e9')."},
+                "from_selector": {"type": "string", "description": "Start element CSS selector (dragged from its center)."},
+                "to_selector": {"type": "string", "description": "End/drop element CSS selector (dragged to its center)."},
+                "from_x": {"type": "number", "description": "Start X in viewport pixels (use with from_y)."},
+                "from_y": {"type": "number", "description": "Start Y in viewport pixels (use with from_x)."},
+                "to_x": {"type": "number", "description": "End X in viewport pixels (use with to_y)."},
+                "to_y": {"type": "number", "description": "End Y in viewport pixels (use with to_x)."},
+                "waypoints": {
+                    "type": "array",
+                    "description": "Optional explicit path between press and release, as a list of {x,y} points.",
+                    "items": {
+                        "type": "object",
+                        "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                    },
+                },
+                "steps": {"type": "integer", "description": "Interpolation steps per move segment (default 20)."},
+                "hold_ms": {"type": "integer", "description": "Pause after pressing the mouse, ms (default 120)."},
+                "release_delay_ms": {"type": "integer", "description": "Pause before releasing, ms (default 120)."},
+                "humanize": {"type": "boolean", "description": "Eased motion with slight jitter (default false)."},
+                "button": {"type": "string", "enum": ["left", "middle", "right"], "description": "Mouse button (default left)."}
+            },
+            "required": []
+        }
+    },
+    {
         "name": "browser_back",
         "description": "Navigate back to the previous page in browser history. Requires browser_navigate to be called first.",
         "parameters": {
@@ -2819,6 +2861,48 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
             "error": result.get("error", f"Failed to click {ref}")
         }
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+def browser_drag(
+    from_ref: Optional[str] = None,
+    to_ref: Optional[str] = None,
+    from_selector: Optional[str] = None,
+    to_selector: Optional[str] = None,
+    from_x: Optional[float] = None,
+    from_y: Optional[float] = None,
+    to_x: Optional[float] = None,
+    to_y: Optional[float] = None,
+    waypoints: Optional[list] = None,
+    steps: Optional[int] = None,
+    hold_ms: Optional[int] = None,
+    release_delay_ms: Optional[int] = None,
+    humanize: Optional[bool] = None,
+    button: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """
+    Perform a real mouse drag (press -> move -> release).
+
+    General-purpose: drag-and-drop, sliders, slider/puzzle CAPTCHAs, and canvas
+    widgets. Provide a start and an end point, each as a ref, a CSS selector, or
+    absolute viewport pixel coordinates.
+
+    Returns:
+        JSON string with the drag result (resolved from/to coordinates).
+    """
+    if _is_camofox_mode():
+        from tools.browser_camofox import camofox_drag
+        return camofox_drag(
+            from_ref=from_ref, to_ref=to_ref,
+            from_selector=from_selector, to_selector=to_selector,
+            from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y,
+            waypoints=waypoints, steps=steps, hold_ms=hold_ms,
+            release_delay_ms=release_delay_ms, humanize=humanize,
+            button=button, task_id=task_id,
+        )
+    return tool_error(
+        "browser_drag is only supported on the Camofox backend.", success=False
+    )
 
 
 def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -4528,6 +4612,23 @@ registry.register(
     handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="📜",
+)
+registry.register(
+    name="browser_drag",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_drag"],
+    handler=lambda args, **kw: browser_drag(
+        from_ref=args.get("from_ref"), to_ref=args.get("to_ref"),
+        from_selector=args.get("from_selector"), to_selector=args.get("to_selector"),
+        from_x=args.get("from_x"), from_y=args.get("from_y"),
+        to_x=args.get("to_x"), to_y=args.get("to_y"),
+        waypoints=args.get("waypoints"), steps=args.get("steps"),
+        hold_ms=args.get("hold_ms"), release_delay_ms=args.get("release_delay_ms"),
+        humanize=args.get("humanize"), button=args.get("button"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🖐️",
 )
 registry.register(
     name="browser_back",

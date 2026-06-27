@@ -678,6 +678,80 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         return tool_error(str(e), success=False)
 
 
+def camofox_drag(
+    from_ref: Optional[str] = None,
+    to_ref: Optional[str] = None,
+    from_x: Optional[float] = None,
+    from_y: Optional[float] = None,
+    to_x: Optional[float] = None,
+    to_y: Optional[float] = None,
+    from_selector: Optional[str] = None,
+    to_selector: Optional[str] = None,
+    waypoints: Optional[list] = None,
+    steps: Optional[int] = None,
+    hold_ms: Optional[int] = None,
+    release_delay_ms: Optional[int] = None,
+    humanize: Optional[bool] = None,
+    button: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Press-move-release mouse drag via Camofox (general-purpose drag-and-drop)."""
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+
+        body: Dict[str, Any] = {"userId": session["user_id"]}
+        # Start point: ref | selector | coords
+        if from_ref:
+            body["fromRef"] = str(from_ref).lstrip("@")
+        elif from_selector:
+            body["fromSelector"] = from_selector
+        if from_x is not None and from_y is not None:
+            body["fromX"], body["fromY"] = from_x, from_y
+        # End point: ref | selector | coords
+        if to_ref:
+            body["toRef"] = str(to_ref).lstrip("@")
+        elif to_selector:
+            body["toSelector"] = to_selector
+        if to_x is not None and to_y is not None:
+            body["toX"], body["toY"] = to_x, to_y
+        # Optional motion controls
+        if waypoints:
+            body["waypoints"] = waypoints
+        if steps is not None:
+            body["steps"] = steps
+        if hold_ms is not None:
+            body["holdMs"] = hold_ms
+        if release_delay_ms is not None:
+            body["releaseDelayMs"] = release_delay_ms
+        if humanize is not None:
+            body["humanize"] = humanize
+        if button:
+            body["button"] = button
+
+        has_start = ("fromRef" in body) or ("fromSelector" in body) or ("fromX" in body)
+        has_end = ("toRef" in body) or ("toSelector" in body) or ("toX" in body)
+        if not has_start or not has_end:
+            return tool_error(
+                "browser_drag needs a start and an end point — each as a ref, a selector, or x/y coordinates.",
+                success=False,
+            )
+
+        data = _post(
+            f"/tabs/{session['tab_id']}/drag",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 45),
+        )
+        return json.dumps({
+            "success": True,
+            "from": data.get("from") if isinstance(data, dict) else None,
+            "to": data.get("to") if isinstance(data, dict) else None,
+        })
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
 def camofox_back(task_id: Optional[str] = None) -> str:
     """Navigate back via Camofox."""
     try:

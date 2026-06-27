@@ -51,6 +51,7 @@ MUTATING_TOOL_NAMES = frozenset(
         "browser_type",
         "browser_press",
         "browser_scroll",
+        "browser_drag",
         "browser_navigate",
         "send_message",
         "cronjob",
