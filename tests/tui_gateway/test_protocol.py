@@ -315,7 +315,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
             ]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None: object())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
     monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
 
@@ -509,7 +509,7 @@ def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
             return [multimodal_user, text_only_assistant]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None: object())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
     monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
 
@@ -795,7 +795,7 @@ def test_session_resume_reuses_existing_live_session(server, monkeypatch):
         def close(self):
             closed_sids.append(self.sid)
 
-    def make_agent(sid, key, session_id=None, session_db=None):
+    def make_agent(sid, key, session_id=None, session_db=None, **_kwargs):
         created_sids.append(sid)
         first_agent_started.set()
         assert agent_can_finish.wait(timeout=1)
@@ -1006,7 +1006,7 @@ def test_session_resume_live_payload_uses_current_history_with_ancestors(server,
     monkeypatch.setattr(
         server,
         "_make_agent",
-        lambda _sid, key, session_id=None, session_db=None: types.SimpleNamespace(
+        lambda _sid, key, session_id=None, session_db=None, **_kwargs: types.SimpleNamespace(
             model="test/model", session_id=session_id or key
         ),
     )
@@ -1144,7 +1144,7 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     monkeypatch.setattr(
         server,
         "_make_agent",
-        lambda _sid, key, session_id=None, session_db=None: types.SimpleNamespace(
+        lambda _sid, key, session_id=None, session_db=None, **_kwargs: types.SimpleNamespace(
             model="test/model", session_id=session_id or key
         ),
     )
@@ -1736,3 +1736,37 @@ def test_dispatch_unknown_long_method_still_goes_inline(server):
     resp = server.dispatch({"id": "r4", "method": "some.method", "params": {}})
 
     assert resp["result"] == {"ok": True}
+
+
+@pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
+def test_completion_handlers_are_pool_routed(completion_method, server):
+    """complete.path/complete.slash must run on the pool, never the reader thread.
+
+    Regression for #21123: completion ran inline, so a slow git ls-files /
+    skill-scan blocked prompt.submit and froze the TUI for the 120s RPC timeout.
+    """
+    assert completion_method in server._LONG_HANDLERS
+
+
+@pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
+def test_slow_completion_does_not_block_fast_handler(completion_method, server):
+    """A slow completion RPC must not block a concurrent fast handler (#21123)."""
+    released = threading.Event()
+
+    def slow_completion(rid, params):
+        released.wait(timeout=5)
+        return server._ok(rid, {"items": []})
+
+    server._methods[completion_method] = slow_completion
+    server._methods["fast.ping"] = lambda rid, params: server._ok(rid, {"pong": True})
+
+    t0 = time.monotonic()
+    assert server.dispatch({"id": "slow", "method": completion_method, "params": {}}) is None
+
+    fast_resp = server.dispatch({"id": "fast", "method": "fast.ping", "params": {}})
+    fast_elapsed = time.monotonic() - t0
+
+    assert fast_resp["result"] == {"pong": True}
+    assert fast_elapsed < 0.5, f"fast handler blocked for {fast_elapsed:.2f}s behind {completion_method}"
+
+    released.set()
