@@ -1731,36 +1731,21 @@ class GatewayStreamConsumer:
                     # preview, so re-deliver as a fresh message + delete the
                     # preview instead.
                     #
-                    # When the adapter exposes prefers_fresh_final_streaming
-                    # and explicitly returns False, the time-based threshold
-                    # must NOT override that decision.  On Telegram the
-                    # fresh-final path sends a Rich Message (sendRichMessage)
-                    # that overlaps with the legacy MarkdownV2 preview already
-                    # visible from streaming — both remain on screen because
-                    # the old message is only best-effort deleted.  Adapters
-                    # without the hook still get the time-based fresh-final.
-                    # (#47048)
-                    # Check the *class* for the hook so MagicMock adapters
-                    # (which auto-create attributes on access) are not
-                    # falsely detected as having it.  Also check instance
-                    # __dict__ for test doubles that explicitly assign the
-                    # attribute (e.g. adapter.prefers_fresh_final_streaming
-                    # = MagicMock(return_value=False)).
-                    _has_prefers_hook = (
-                        hasattr(type(self.adapter),
-                                "prefers_fresh_final_streaming")
-                        or "prefers_fresh_final_streaming"
-                            in getattr(self.adapter, "__dict__", {})
-                    )
+                    # hermes-mods: the explicit fresh_final_after_seconds
+                    # opt-in overrides the adapter's prefers_fresh_final_
+                    # streaming=False veto (upstream #47048 blocked it).  A
+                    # Telegram finalize-by-edit never fires a push
+                    # notification, so streamed finals in DM topics arrive
+                    # silent; the operator opting into a threshold > 0
+                    # accepts the preview-delete flicker in exchange for a
+                    # notifying fresh final.  Default 0 keeps upstream
+                    # behavior.
                     _prefers_fresh = self._adapter_prefers_fresh_final(text)
                     if (
                         finalize
                         and (
                             _prefers_fresh
-                            or (
-                                not _has_prefers_hook
-                                and self._should_send_fresh_final()
-                            )
+                            or self._should_send_fresh_final()
                         )
                         and await self._try_fresh_final(
                             text, is_turn_final=is_turn_final,

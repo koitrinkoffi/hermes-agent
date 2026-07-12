@@ -2021,20 +2021,24 @@ class TestUtf16OverflowDetection:
 
 
 class TestFreshFinalRespectsAdapterDecline:
-    """Regression: when an adapter explicitly declines fresh-final via
-    ``prefers_fresh_final_streaming = False``, the time-based
-    ``_should_send_fresh_final()`` must NOT override that decision.
-    (#47048 — Telegram rich-message overlap with legacy MarkdownV2 preview)
+    """hermes-mods: an explicit ``fresh_final_after_seconds`` opt-in
+    overrides the adapter's ``prefers_fresh_final_streaming = False``
+    decline (upstream #47048 vetoed it).  A finalize-by-edit never fires
+    a Telegram push notification, so the operator-configured threshold
+    must win and deliver the final as a fresh, notifying message.
     """
 
     @pytest.mark.asyncio
     async def test_adapter_decline_fresh_final_overrides_time_threshold(self):
-        """Adapter with prefers_fresh_final_streaming=False must NOT take
-        the fresh-final path even when fresh_final_after_seconds is large."""
+        """Adapter with prefers_fresh_final_streaming=False still takes
+        the fresh-final path when fresh_final_after_seconds is exceeded."""
         adapter = MagicMock()
         adapter.MAX_MESSAGE_LENGTH = 4096
         adapter.send = AsyncMock(
-            return_value=SimpleNamespace(success=True, message_id="rich_msg"),
+            side_effect=[
+                SimpleNamespace(success=True, message_id="preview_msg"),
+                SimpleNamespace(success=True, message_id="fresh_final_msg"),
+            ],
         )
         adapter.edit_message = AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="edit_msg"),
@@ -2046,7 +2050,7 @@ class TestFreshFinalRespectsAdapterDecline:
         config = StreamConsumerConfig(
             edit_interval=0.01,
             buffer_threshold=5,
-            fresh_final_after_seconds=1.0,  # time threshold would trigger
+            fresh_final_after_seconds=1.0,  # explicit operator opt-in
             cursor=" ▉",
         )
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
@@ -2065,18 +2069,13 @@ class TestFreshFinalRespectsAdapterDecline:
         consumer.finish()
         await task
 
-        # The adapter declined fresh-final, so send() should NOT have been
-        # called for the final message — only edit_message(finalize=True).
-        adapter.send.assert_called_once()  # Only the initial send
-        adapter.edit_message.assert_called()  # Finalize edit
-        # Verify edit was called with finalize=True
-        edit_calls = [
-            c for c in adapter.edit_message.call_args_list
-            if c.kwargs.get("finalize") or (len(c.args) > 3 and c.args[3])
-        ]
-        assert len(edit_calls) >= 1, (
-            "Expected finalize=True edit call, got none"
-        )
+        # The operator opt-in wins over the adapter decline: the final is
+        # delivered as a fresh send (initial preview + fresh final = 2)
+        # and the stale preview is deleted.
+        assert adapter.send.call_count == 2
+        adapter.delete_message.assert_called()
+        final_call = adapter.send.call_args_list[-1]
+        assert (final_call.kwargs.get("metadata") or {}).get("notify") is True
 
     @pytest.mark.asyncio
     async def test_no_hook_adapter_uses_time_threshold(self):
