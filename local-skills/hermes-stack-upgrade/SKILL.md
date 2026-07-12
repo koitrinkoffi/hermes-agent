@@ -16,24 +16,29 @@ metadata:
 Upgrades two coupled repos at once — the Hermes agent (`~/.hermes/hermes-agent`)
 and the camofox browser server (`~/camofox`) — without losing your local
 modifications, using the **fork workflow**: `origin` = your GitHub fork (carries
-your mods), `upstream` = the official repo. Your mods live on `main` (hermes) and
-`hermes-mods` (camofox).
+your mods), `upstream` = the official repo. Your mods live on the **`hermes-mods`**
+branch in **both** repos (hermes and camofox alike); each repo's `main`/`master`
+stays a clean upstream mirror. Normal operation runs checked out on `hermes-mods`.
 
 ## When to Use
 
 - The user asks to **update / upgrade Hermes** (or "update the browser stack").
 - After seeing "update available" — instead of bare `hermes update`, which would
-  switch HEAD to `main` and **deactivate your mods**.
+  switch HEAD to the mods-free `main` and **deactivate your mods**.
 
-Do **not** use bare `hermes update` on this machine: it targets official `main`
-and drops your customizations. This skill is the supported path here.
+Do **not** use bare `hermes update` on this machine: it checks out `main` (now a
+clean upstream mirror with none of your mods) and drops your customizations from
+the working tree. This skill is the supported path here.
 
 ## Why this exists (the trap)
 
 `hermes update` checks out `main` and fast-forwards/`reset --hard`s it to
-`origin/main`. Bundled upstream fork-sync **deliberately skips** when your fork
-is ahead (`"Skipping upstream sync to preserve your changes"`), so the upstream
-merge is *yours* to drive. This skill drives it and verifies the result.
+`origin/main`. Your mods live on **`hermes-mods`**, not `main`, so this switches
+the working tree to the mods-free `main` and **deactivates every mod** until you
+`git checkout hermes-mods` again. Bundled upstream fork-sync also **deliberately
+skips** when your fork is ahead (`"Skipping upstream sync to preserve your
+changes"`), so the upstream → `hermes-mods` merge is *yours* to drive. This skill
+drives it and verifies the result.
 
 ## Procedure (recurring upgrade)
 
@@ -49,7 +54,7 @@ at any ✗ or exit code 2.
 
 2. **Merge upstream into each repo.** Hermes first, then camofox:
    ```bash
-   bash ${HERMES_SKILL_DIR}/scripts/sync_repo.sh "$HOME/.hermes/hermes-agent" main main
+   bash ${HERMES_SKILL_DIR}/scripts/sync_repo.sh "$HOME/.hermes/hermes-agent" hermes-mods main
    bash ${HERMES_SKILL_DIR}/scripts/sync_repo.sh "$HOME/camofox" hermes-mods master
    ```
    - **Exit 0** → clean merge, continue.
@@ -104,8 +109,9 @@ at any ✗ or exit code 2.
    git remote rename origin upstream
    git remote add origin https://github.com/<you>/camofox-browser.git
    ```
-3. Put your mods on the upgrade branches (`main` for hermes, `hermes-mods` for
-   camofox) and push to your forks.
+3. Put your mods on the `hermes-mods` branch in **both** repos (`hermes-mods` for
+   hermes and camofox alike; each `main`/`master` stays a clean upstream mirror)
+   and push to your forks. Stay checked out on `hermes-mods` for normal operation.
 4. Deploy this skill: `bash <canonical>/scripts/deploy_self.sh`.
 
 ## Pitfalls
@@ -124,6 +130,6 @@ at any ✗ or exit code 2.
 
 - `smoke.sh` exits 0 (all three layers pass).
 - `git -C ~/.hermes/hermes-agent log --oneline -1` shows your mod commit reachable
-  from `main`; `git -C ~/camofox log --oneline -1` likewise on `hermes-mods`.
+  from `hermes-mods`; `git -C ~/camofox log --oneline -1` likewise on `hermes-mods`.
 - `gh repo view <you>/hermes-agent` and `<you>/camofox-browser` reflect the new
   push timestamps.

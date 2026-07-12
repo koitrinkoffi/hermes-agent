@@ -3,7 +3,7 @@
 # non-force-push integration). Generic over both repos.
 #
 # Usage: sync_repo.sh <repo_dir> <mods_branch> <upstream_branch>
-#   e.g. sync_repo.sh ~/.hermes/hermes-agent main main
+#   e.g. sync_repo.sh ~/.hermes/hermes-agent hermes-mods main
 #        sync_repo.sh ~/camofox hermes-mods master
 #
 # Exit 0 = clean merge (or already up to date).

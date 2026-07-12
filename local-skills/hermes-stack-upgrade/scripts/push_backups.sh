@@ -17,6 +17,6 @@ push() {
   fi
 }
 
-push "$HERMES_REPO" main
+push "$HERMES_REPO" hermes-mods
 push "$CAMOFOX_REPO" hermes-mods
 echo "✓ backups updated"

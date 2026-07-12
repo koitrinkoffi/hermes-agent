@@ -42,7 +42,7 @@ check_repo() {
 
 : > "$STATE_FILE.tmp"
 echo "UPGRADE_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STATE_FILE.tmp"
-check_repo HERMES "$HERMES_REPO" main
+check_repo HERMES "$HERMES_REPO" hermes-mods
 check_repo CAMOFOX "$CAMOFOX_REPO" hermes-mods
 mv "$STATE_FILE.tmp" "$STATE_FILE"
 
