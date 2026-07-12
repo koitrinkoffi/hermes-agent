@@ -806,6 +806,27 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
     return removed
 
 
+def cleanup_audio_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached audio (inbound voice notes) older than *max_age_hours*.
+
+    Returns the number of files removed.
+    """
+    import time
+
+    cache_dir = get_audio_cache_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Audio cache utilities
 #
@@ -940,6 +961,27 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
     return str(filepath)
 
 
+def cleanup_video_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached videos older than *max_age_hours*.
+
+    Returns the number of files removed.
+    """
+    import time
+
+    cache_dir = get_video_cache_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Document cache utilities
 #
@@ -959,6 +1001,37 @@ _CACHE_DIR_IMPORT_DEFAULTS = {
     "DOCUMENT_CACHE_DIR": DOCUMENT_CACHE_DIR,
     "SCREENSHOT_CACHE_DIR": SCREENSHOT_CACHE_DIR,
 }
+
+def get_screenshot_cache_dir() -> Path:
+    """Return the browser-screenshot cache directory, creating it if needed."""
+    d = _resolve_cache_dir("SCREENSHOT_CACHE_DIR", "cache/screenshots", "browser_screenshots")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def cleanup_screenshot_cache(max_age_hours: int = 24) -> int:
+    """
+    Delete cached browser screenshots older than *max_age_hours*.
+
+    Timer-based safety net for the trigger-based ``_cleanup_old_screenshots``
+    in ``tools/browser_tool.py``, which only fires while the browser is active.
+
+    Returns the number of files removed.
+    """
+    import time
+
+    cache_dir = get_screenshot_cache_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
 
 _HERMES_HOME = get_hermes_home()
 _HERMES_ROOT = get_default_hermes_root()

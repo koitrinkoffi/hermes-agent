@@ -20242,11 +20242,17 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     this housekeeping still wants its hourly cadence — so it owns its own loop.
 
     Refreshes the channel directory every 5 minutes and prunes the
-    image/audio/document cache + expired ``hermes debug share`` pastes once per
-    hour, and polls the curator hourly (its inner gate enforces the real
-    weekly cadence).
+    image/audio/video/document/screenshot cache + expired ``hermes debug
+    share`` pastes once per hour, and polls the curator hourly (its inner gate
+    enforces the real weekly cadence).
     """
-    from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
+    from gateway.platforms.base import (
+        cleanup_image_cache,
+        cleanup_document_cache,
+        cleanup_audio_cache,
+        cleanup_video_cache,
+        cleanup_screenshot_cache,
+    )
     from hermes_cli.debug import _sweep_expired_pastes
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
@@ -20290,6 +20296,24 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     logger.info("Document cache cleanup: removed %d stale file(s)", removed)
             except Exception as e:
                 logger.debug("Document cache cleanup error: %s", e)
+            try:
+                removed = cleanup_audio_cache(max_age_hours=24)
+                if removed:
+                    logger.info("Audio cache cleanup: removed %d stale file(s)", removed)
+            except Exception as e:
+                logger.debug("Audio cache cleanup error: %s", e)
+            try:
+                removed = cleanup_video_cache(max_age_hours=24)
+                if removed:
+                    logger.info("Video cache cleanup: removed %d stale file(s)", removed)
+            except Exception as e:
+                logger.debug("Video cache cleanup error: %s", e)
+            try:
+                removed = cleanup_screenshot_cache(max_age_hours=24)
+                if removed:
+                    logger.info("Screenshot cache cleanup: removed %d stale file(s)", removed)
+            except Exception as e:
+                logger.debug("Screenshot cache cleanup error: %s", e)
 
         if tick_count % PASTE_SWEEP_EVERY == 0:
             try:
