@@ -797,6 +797,48 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         return tool_error(str(e), success=False)
 
 
+def camofox_mouse_wheel(
+    delta_y: float = 0,
+    delta_x: float = 0,
+    ref: Optional[str] = None,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Real mouse wheel at an element (ref), coordinates, or viewport centre via Camofox."""
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+        if not delta_x and not delta_y:
+            return tool_error("browser_mouse_wheel needs a non-zero delta_x or delta_y.", success=False)
+
+        body: Dict[str, Any] = {
+            "userId": session["user_id"],
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+        }
+        if ref:
+            body["ref"] = str(ref).lstrip("@")
+        elif x is not None and y is not None:
+            body["x"], body["y"] = x, y
+
+        data = _post(
+            f"/tabs/{session['tab_id']}/mouse-wheel",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 30),
+        )
+        return json.dumps({
+            "success": True,
+            "x": data.get("x") if isinstance(data, dict) else None,
+            "y": data.get("y") if isinstance(data, dict) else None,
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+        })
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
 def camofox_drag(
     from_ref: Optional[str] = None,
     to_ref: Optional[str] = None,

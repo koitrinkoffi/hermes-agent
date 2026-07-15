@@ -1894,6 +1894,28 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_mouse_wheel",
+        "description": (
+            "Scroll a specific nested/inner scrollable container with a real mouse "
+            "wheel event, targeted at an element ref (preferred), explicit x/y "
+            "viewport coordinates, or the viewport centre. Use this when "
+            "browser_scroll (page-level) does not move a virtualised feed, chat/message "
+            "list, dropdown, or map that only scrolls when the pointer is over it. "
+            "Positive deltaY scrolls down, negative up. Requires browser_navigate first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "delta_y": {"type": "number", "description": "Vertical wheel delta in pixels (positive = down, negative = up). Default 0."},
+                "delta_x": {"type": "number", "description": "Horizontal wheel delta in pixels. Default 0."},
+                "ref": {"type": "string", "description": "Element ref (e.g. 'e22') to hover before wheeling; the wheel fires at its centre. Preferred over x/y."},
+                "x": {"type": "number", "description": "Explicit x viewport coordinate (ignored if ref is set)."},
+                "y": {"type": "number", "description": "Explicit y viewport coordinate (ignored if ref is set)."}
+            },
+            "required": []
+        }
+    },
+    {
         "name": "browser_drag",
         "description": (
             "Perform a real mouse drag (press -> move -> release) for drag-and-drop, "
@@ -3226,6 +3248,35 @@ def browser_drag(
         )
     return tool_error(
         "browser_drag is only supported on the Camofox backend.", success=False
+    )
+
+
+def browser_mouse_wheel(
+    delta_y: Optional[float] = None,
+    delta_x: Optional[float] = None,
+    ref: Optional[str] = None,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """
+    Scroll a nested/inner scrollable container with a real mouse wheel event.
+
+    Targets an element ref (preferred), explicit x/y viewport coordinates, or the
+    viewport centre. Use for virtualised feeds, chat/message lists, dropdowns and
+    maps that ignore page-level browser_scroll.
+
+    Returns:
+        JSON string with the resolved wheel coordinates.
+    """
+    if _is_camofox_mode():
+        from tools.browser_camofox import camofox_mouse_wheel
+        return camofox_mouse_wheel(
+            delta_y=delta_y or 0, delta_x=delta_x or 0,
+            ref=ref, x=x, y=y, task_id=task_id,
+        )
+    return tool_error(
+        "browser_mouse_wheel is only supported on the Camofox backend.", success=False
     )
 
 
@@ -5413,6 +5464,18 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="🖐️",
+)
+registry.register(
+    name="browser_mouse_wheel",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_mouse_wheel"],
+    handler=lambda args, **kw: browser_mouse_wheel(
+        delta_y=args.get("delta_y"), delta_x=args.get("delta_x"),
+        ref=args.get("ref"), x=args.get("x"), y=args.get("y"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🖱️",
 )
 registry.register(
     name="browser_back",
