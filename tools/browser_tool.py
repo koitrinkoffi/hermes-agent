@@ -889,6 +889,66 @@ def _should_inject_engine(engine: str) -> bool:
     return _is_local_mode()
 
 
+_local_browser_settings_resolved = False
+_cached_local_browser_settings: Dict[str, Any] = {}
+
+
+def _get_local_browser_settings() -> Dict[str, Any]:
+    """Return the ``browser.local`` config block (cached).
+
+    Controls the persistent-profile local backend (hermes-mods):
+
+    * ``profile_dir`` — Chromium user-data directory.  When set, local
+      sessions stop using ephemeral ``h_<uuid>`` names and instead share one
+      fixed agent-browser session backed by this profile, so cookies and
+      logins survive daemon and Hermes restarts.
+    * ``headed`` — launch with a visible window (``--headed``).  When no
+      DISPLAY is available agent-browser falls back to Xvfb automatically.
+    * ``session_name`` — fixed agent-browser session name (default ``hermes``).
+    * ``viewport`` — ``"WxH"`` re-applied after every ``open`` so pages always
+      render at the same aspect ratio regardless of window-manager sizing.
+    """
+    global _local_browser_settings_resolved, _cached_local_browser_settings
+    if _local_browser_settings_resolved:
+        return _cached_local_browser_settings
+
+    settings: Dict[str, Any] = {
+        "profile_dir": None,
+        "headed": False,
+        "session_name": "hermes",
+        "viewport": None,
+    }
+    try:
+        from hermes_cli.config import read_raw_config
+        block = (read_raw_config().get("browser", {}) or {}).get("local", {}) or {}
+        profile_dir = str(block.get("profile_dir") or "").strip()
+        if profile_dir:
+            settings["profile_dir"] = os.path.expanduser(profile_dir)
+        settings["headed"] = bool(block.get("headed", False))
+        session_name = str(block.get("session_name") or "").strip()
+        if session_name:
+            settings["session_name"] = session_name
+        viewport = str(block.get("viewport") or "").strip().lower()
+        if viewport:
+            try:
+                w, h = (int(p) for p in viewport.split("x", 1))
+                if w > 0 and h > 0:
+                    settings["viewport"] = (w, h)
+            except (ValueError, TypeError):
+                logger.warning("Invalid browser.local.viewport %r (want WxH)", viewport)
+    except Exception as e:
+        logger.debug("Could not read browser.local config: %s", e)
+
+    _cached_local_browser_settings = settings
+    _local_browser_settings_resolved = True
+    return settings
+
+
+def _local_persistent_profile_dir() -> Optional[str]:
+    """Profile dir for the persistent local backend, or None when unset."""
+    return _get_local_browser_settings()["profile_dir"]
+
+
 def _using_lightpanda_engine() -> bool:
     """Return True when local browser commands are configured for Lightpanda."""
     return _get_browser_engine() == "lightpanda"
@@ -2076,7 +2136,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_dropzone_upload",
-        "description": "Attach one or more local files to a drag-and-drop uploader (Dropzone.js and similar 'drop files here' zones) where browser_upload fails because the file input is hidden/JS-managed. Provide the dropzone element's CSS selector. Requires browser_navigate first. Camofox backend only.",
+        "description": "Attach one or more local files to a drag-and-drop uploader (Dropzone.js and similar 'drop files here' zones) where browser_upload fails because the file input is hidden/JS-managed. Provide the dropzone element's CSS selector. Requires browser_navigate first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2115,6 +2175,115 @@ BROWSER_TOOL_SCHEMAS = [
             "required": ["ref"]
         }
     },
+    {
+        "name": "browser_wait",
+        "description": "Wait for the page to reach a condition before continuing: an element to appear, text to show up, a load state, or a fixed delay. Use after clicks/navigation on dynamic (SPA) pages instead of re-snapshotting and hoping the page is ready.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "Wait for this element to appear (CSS selector or snapshot ref like '@e5')"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Wait for this text to appear anywhere on the page (substring match)"
+                },
+                "load_state": {
+                    "type": "string",
+                    "enum": ["load", "domcontentloaded", "networkidle"],
+                    "description": "Wait for a page load state ('networkidle' = no network activity)"
+                },
+                "ms": {
+                    "type": "integer",
+                    "description": "Wait a fixed number of milliseconds (last resort; prefer the condition-based modes)"
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "browser_read",
+        "description": "Extract the current page's content as clean markdown (readability-style). Much more token-efficient than browser_snapshot when the goal is to READ content (an article, a listing, a profile) rather than interact with the page. Requires browser_navigate first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "description": "Optional text filter: only return content sections matching this text"
+                },
+                "outline": {
+                    "type": "boolean",
+                    "description": "Return only the page outline (headings structure) instead of full content"
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "browser_eval",
+        "description": "Execute a JavaScript expression in the current page and return its result. Powerful escape hatch: extract structured data in one call, scroll inner containers, trigger events the accessibility tree can't reach. Use sparingly, prefer dedicated browser tools when they suffice.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "JavaScript expression to evaluate (e.g., \"document.querySelectorAll('.price').length\"). Async/await is supported."
+                }
+            },
+            "required": ["expression"]
+        }
+    },
+    {
+        "name": "browser_pdf",
+        "description": "Save the current page as a PDF file (useful for archiving listings, receipts, articles). If no path is provided, Hermes saves it to the persistent default downloads directory and returns the absolute path. Requires browser_navigate first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional destination .pdf file path. If omitted, Hermes chooses a persistent default path."
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "browser_mouse",
+        "description": "Low-level mouse control: move the cursor, press/release a button, or hover an element. Combine move/down/up for custom gestures; use hover to trigger menus and tooltips. Target with a snapshot ref, a CSS selector, or absolute viewport x/y coordinates.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["move", "down", "up", "hover"],
+                    "description": "Mouse action: 'move' cursor, 'down' press button, 'up' release button, 'hover' an element"
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Element reference from the snapshot (e.g., '@e5') for move/hover targets"
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector for move/hover targets (alternative to ref)"
+                },
+                "x": {
+                    "type": "number",
+                    "description": "Viewport x coordinate (alternative to ref/selector, for 'move')"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Viewport y coordinate (alternative to ref/selector, for 'move')"
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "middle", "right"],
+                    "description": "Mouse button for down/up (default 'left')"
+                }
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 
@@ -2124,6 +2293,26 @@ BROWSER_TOOL_SCHEMAS = [
 
 def _create_local_session(task_id: str) -> Dict[str, str]:
     import uuid
+    local_settings = _get_local_browser_settings()
+    if local_settings["profile_dir"]:
+        # Persistent-profile mode (hermes-mods): every task shares one fixed
+        # session backed by the same Chromium profile, so logins persist
+        # across restarts.  Chromium locks the user-data dir, so a single
+        # shared browser is a requirement here, not just a simplification.
+        session_name = local_settings["session_name"]
+        try:
+            os.makedirs(local_settings["profile_dir"], mode=0o700, exist_ok=True)
+        except OSError as e:
+            logger.warning("Could not create browser profile dir %s: %s",
+                           local_settings["profile_dir"], e)
+        logger.info("Using persistent local browser session %s (profile=%s) for task %s",
+                    session_name, local_settings["profile_dir"], task_id)
+        return {
+            "session_name": session_name,
+            "bb_session_id": None,
+            "cdp_url": None,
+            "features": {"local": True, "persistent_profile": True},
+        }
     session_name = f"h_{uuid.uuid4().hex[:10]}"
     logger.info("Created local browser session %s for task %s",
                 session_name, task_id)
@@ -2492,6 +2681,15 @@ def _run_browser_command(
     else:
         # Local mode — launch a headless Chromium instance
         backend_args = ["--session", session_info["session_name"]]
+        # Persistent-profile mode: launch-relevant flags (--profile, --headed)
+        # are part of agent-browser's launch identity, so they must be passed
+        # on EVERY invocation — omitting them on a later call makes the daemon
+        # treat it as a different browser config and spawn a second instance.
+        if session_info.get("features", {}).get("persistent_profile"):
+            local_settings = _get_local_browser_settings()
+            backend_args += ["--profile", local_settings["profile_dir"]]
+            if local_settings["headed"]:
+                backend_args.append("--headed")
 
     # Lightpanda engine injection (local mode only, agent-browser v0.25.3+).
     # Use the resolved session backend rather than global cloud-provider state:
@@ -2727,6 +2925,25 @@ def _run_browser_command(
         else:
             fallback_result = _run_chrome_fallback_command(task_id, command, args, timeout)
         return _annotate_lightpanda_fallback(fallback_result, fallback_reason)
+
+    # Persistent-profile mode: re-apply the configured viewport after every
+    # successful navigation.  Window managers (Wayland/mutter) override the
+    # requested window size, and a viewport set via CDP emulation survives
+    # navigations but not browser relaunches — re-applying on "open" keeps
+    # pages rendering at the configured aspect ratio in all cases.
+    if (
+        command == "open"
+        and result.get("success")
+        and session_info.get("features", {}).get("persistent_profile")
+    ):
+        viewport = _get_local_browser_settings()["viewport"]
+        if viewport:
+            vw, vh = viewport
+            vp_result = _run_browser_command(
+                task_id, "set", ["viewport", str(vw), str(vh)]
+            )
+            if not vp_result.get("success"):
+                logger.debug("viewport re-apply failed: %s", vp_result.get("error"))
 
     return result
 
@@ -3209,6 +3426,45 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
+def _fmt_coord(value: float) -> str:
+    """Format a coordinate/delta for agent-browser mouse commands.
+
+    agent-browser's `mouse move`/`mouse wheel` argument parser rejects
+    floating-point strings ("100.0" -> 'missing arguments'); it only accepts
+    integers.  Round to the nearest whole pixel.
+    """
+    return str(int(round(float(value))))
+
+
+def _resolve_viewport_point(
+    task_id: str,
+    ref: Optional[str] = None,
+    selector: Optional[str] = None,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+) -> tuple:
+    """Resolve a target to viewport coordinates (center of the element box).
+
+    Returns (x, y, None) on success or (None, None, error_message) on failure.
+    Explicit coordinates win over ref/selector.
+    """
+    if x is not None and y is not None:
+        return float(x), float(y), None
+    target = _normalize_ref(ref) if ref else (selector or "").strip()
+    if not target:
+        return None, None, "Provide a ref, a selector, or x/y coordinates"
+    result = _run_browser_command(task_id, "get", ["box", target])
+    if not result.get("success"):
+        return None, None, result.get("error", f"Could not resolve position of {target}")
+    box = result.get("data", {}) or {}
+    try:
+        cx = float(box["x"]) + float(box.get("width", 0)) / 2
+        cy = float(box["y"]) + float(box.get("height", 0)) / 2
+    except (KeyError, TypeError, ValueError):
+        return None, None, f"Element {target} returned no usable bounding box"
+    return round(cx, 1), round(cy, 1), None
+
+
 def browser_drag(
     from_ref: Optional[str] = None,
     to_ref: Optional[str] = None,
@@ -3246,9 +3502,104 @@ def browser_drag(
             release_delay_ms=release_delay_ms, humanize=humanize,
             button=button, task_id=task_id,
         )
-    return tool_error(
-        "browser_drag is only supported on the Camofox backend.", success=False
-    )
+
+    effective_task_id = _last_session_key(task_id or "default")
+    blocked = _blocked_private_page_action(effective_task_id, "drag")
+    if blocked is not None:
+        return blocked
+
+    # Element-to-element drag with no coordinate/path tuning maps straight
+    # onto the native agent-browser `drag <src> <dst>` command.
+    coords_given = any(v is not None for v in (from_x, from_y, to_x, to_y))
+    if not coords_given and not waypoints:
+        src = _normalize_ref(from_ref) if from_ref else from_selector
+        dst = _normalize_ref(to_ref) if to_ref else to_selector
+        if src and dst:
+            result = _run_browser_command(effective_task_id, "drag", [src, dst])
+            if result.get("success"):
+                return json.dumps({"success": True, "from": src, "to": dst},
+                                  ensure_ascii=False)
+            return json.dumps({
+                "success": False,
+                "error": result.get("error", f"Failed to drag {src} to {dst}"),
+            }, ensure_ascii=False)
+
+    # Coordinate path (sliders, canvas, CAPTCHAs): synthesize the drag with
+    # raw mouse events — move, press, interpolated moves, release.
+    fx, fy, err = _resolve_viewport_point(
+        effective_task_id, ref=from_ref, selector=from_selector, x=from_x, y=from_y)
+    if err:
+        return json.dumps({"success": False, "error": f"drag start: {err}"},
+                          ensure_ascii=False)
+    tx, ty, err = _resolve_viewport_point(
+        effective_task_id, ref=to_ref, selector=to_selector, x=to_x, y=to_y)
+    if err:
+        return json.dumps({"success": False, "error": f"drag end: {err}"},
+                          ensure_ascii=False)
+
+    anchors = [(fx, fy)]
+    for wp in (waypoints or []):
+        try:
+            if isinstance(wp, dict):
+                anchors.append((float(wp["x"]), float(wp["y"])))
+            else:
+                anchors.append((float(wp[0]), float(wp[1])))
+        except (KeyError, IndexError, TypeError, ValueError):
+            return json.dumps({
+                "success": False,
+                "error": f"Invalid waypoint {wp!r} (want {{'x': .., 'y': ..}})",
+            }, ensure_ascii=False)
+    anchors.append((tx, ty))
+
+    n_steps = max(2, int(steps) if steps else 12)
+    btn_args = [button] if button else []
+
+    def _mouse(action: str, extra: List[str]) -> Dict[str, Any]:
+        return _run_browser_command(effective_task_id, "mouse", [action] + extra)
+
+    import time as _time
+    sequence_error = None
+    result = _mouse("move", [_fmt_coord(fx), _fmt_coord(fy)])
+    if result.get("success"):
+        result = _mouse("down", btn_args)
+    if result.get("success"):
+        if hold_ms:
+            _time.sleep(min(int(hold_ms), 5000) / 1000)
+        total_legs = len(anchors) - 1
+        steps_per_leg = max(1, n_steps // total_legs)
+        for i in range(total_legs):
+            ax, ay = anchors[i]
+            bx, by = anchors[i + 1]
+            for s in range(1, steps_per_leg + 1):
+                t = s / steps_per_leg
+                mx, my = ax + (bx - ax) * t, ay + (by - ay) * t
+                result = _mouse("move", [_fmt_coord(mx), _fmt_coord(my)])
+                if not result.get("success"):
+                    sequence_error = result.get("error")
+                    break
+            if sequence_error:
+                break
+        if not sequence_error and release_delay_ms:
+            _time.sleep(min(int(release_delay_ms), 5000) / 1000)
+    else:
+        sequence_error = result.get("error")
+    # Always release the button, even after a mid-drag failure — a stuck
+    # pressed button corrupts every subsequent click in the session.
+    up_result = _mouse("up", btn_args)
+    if sequence_error is None and not result.get("success"):
+        sequence_error = result.get("error")
+    if sequence_error is None and not up_result.get("success"):
+        sequence_error = up_result.get("error")
+
+    if sequence_error:
+        return json.dumps({"success": False, "error": f"Drag failed: {sequence_error}"},
+                          ensure_ascii=False)
+    return json.dumps({
+        "success": True,
+        "from": {"x": fx, "y": fy},
+        "to": {"x": tx, "y": ty},
+        "steps": n_steps,
+    }, ensure_ascii=False)
 
 
 def browser_mouse_wheel(
@@ -3275,9 +3626,39 @@ def browser_mouse_wheel(
             delta_y=delta_y or 0, delta_x=delta_x or 0,
             ref=ref, x=x, y=y, task_id=task_id,
         )
-    return tool_error(
-        "browser_mouse_wheel is only supported on the Camofox backend.", success=False
-    )
+
+    effective_task_id = _last_session_key(task_id or "default")
+    blocked = _blocked_private_page_action(effective_task_id, "scroll")
+    if blocked is not None:
+        return blocked
+
+    # Position the cursor over the target first — wheel events land at the
+    # current mouse position, and inner scrollables only react when hovered.
+    px, py = None, None
+    if ref or (x is not None and y is not None):
+        px, py, err = _resolve_viewport_point(effective_task_id, ref=ref, x=x, y=y)
+        if err:
+            return json.dumps({"success": False, "error": err}, ensure_ascii=False)
+        move_result = _run_browser_command(
+            effective_task_id, "mouse", ["move", _fmt_coord(px), _fmt_coord(py)])
+        if not move_result.get("success"):
+            return json.dumps({
+                "success": False,
+                "error": move_result.get("error", "Failed to move mouse to target"),
+            }, ensure_ascii=False)
+
+    result = _run_browser_command(
+        effective_task_id, "mouse",
+        ["wheel", _fmt_coord(delta_y or 0), _fmt_coord(delta_x or 0)])
+    if result.get("success"):
+        response = {"success": True, "delta_y": delta_y or 0, "delta_x": delta_x or 0}
+        if px is not None:
+            response["at"] = {"x": px, "y": py}
+        return json.dumps(response, ensure_ascii=False)
+    return json.dumps({
+        "success": False,
+        "error": result.get("error", "Mouse wheel failed"),
+    }, ensure_ascii=False)
 
 
 def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -4402,9 +4783,98 @@ def browser_dropzone_upload(selector: Optional[str] = None, path: Optional[str] 
         from tools.browser_camofox import camofox_dropzone_upload
         return camofox_dropzone_upload(drop_selector, normalized_paths, task_id=task_id)
 
+    effective_task_id = _last_session_key(task_id or "default")
+
+    # Dropzone widgets almost always wrap a hidden <input type=file>. Try that
+    # input first, scoped to the dropzone so we never upload to an unrelated
+    # file input elsewhere on the page. If the selector IS itself a file input,
+    # target it directly. No page-wide fallback — a wrong-target upload is
+    # worse than falling through to the synthetic drop below.
+    candidates = [f"{drop_selector} input[type=file]"]
+    if "input" in drop_selector.lower():
+        candidates.append(drop_selector)
+    upload_errors = []
+    for candidate in candidates:
+        result = _run_browser_command(
+            effective_task_id, "upload", [candidate, *normalized_paths],
+            timeout=max(_get_command_timeout(), 60),
+        )
+        if result.get("success"):
+            return json.dumps({
+                "success": True,
+                "element": candidate,
+                "uploaded_paths": normalized_paths,
+                "method": "file_input",
+            }, ensure_ascii=False)
+        upload_errors.append(f"{candidate}: {result.get('error', 'failed')}")
+
+    # Last resort: synthesize a real drop event with the file bytes embedded
+    # as base64.  argv size limits (MAX_ARG_STRLEN ≈ 128 KiB per argument on
+    # Linux) cap this path to small files.
+    _SYNTH_DROP_MAX_BYTES = 90 * 1024
+    total_size = 0
+    for p in normalized_paths:
+        try:
+            total_size += os.path.getsize(p)
+        except OSError as e:
+            return json.dumps({"success": False, "error": f"Cannot read {p}: {e}"},
+                              ensure_ascii=False)
+    if total_size > _SYNTH_DROP_MAX_BYTES:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "No usable file input found for the dropzone and the files are "
+                f"too large ({total_size} bytes) for a synthetic drop event "
+                f"(limit {_SYNTH_DROP_MAX_BYTES}). Tried: "
+                + "; ".join(upload_errors)
+            ),
+        }, ensure_ascii=False)
+
+    import base64
+    import mimetypes
+    files_payload = []
+    for p in normalized_paths:
+        with open(p, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        mime = mimetypes.guess_type(p)[0] or "application/octet-stream"
+        files_payload.append({"name": os.path.basename(p), "mime": mime, "b64": b64})
+
+    drop_js = (
+        "(() => {"
+        f"const el = document.querySelector({json.dumps(drop_selector)});"
+        "if (!el) return JSON.stringify({ok:false, error:'dropzone selector not found'});"
+        f"const files = {json.dumps(files_payload)};"
+        "const dt = new DataTransfer();"
+        "for (const f of files) {"
+        "  const bytes = Uint8Array.from(atob(f.b64), c => c.charCodeAt(0));"
+        "  dt.items.add(new File([bytes], f.name, {type: f.mime}));"
+        "}"
+        "for (const type of ['dragenter', 'dragover', 'drop']) {"
+        "  el.dispatchEvent(new DragEvent(type, {bubbles: true, cancelable: true, dataTransfer: dt}));"
+        "}"
+        "return JSON.stringify({ok: true});"
+        "})()"
+    )
+    result = _run_browser_command(effective_task_id, "eval", [drop_js])
+    if result.get("success"):
+        try:
+            outcome = json.loads((result.get("data", {}) or {}).get("result") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            outcome = {}
+        if outcome.get("ok"):
+            return json.dumps({
+                "success": True,
+                "element": drop_selector,
+                "uploaded_paths": normalized_paths,
+                "method": "synthetic_drop",
+            }, ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "error": outcome.get("error", "Synthetic drop was dispatched but not confirmed"),
+        }, ensure_ascii=False)
     return json.dumps({
         "success": False,
-        "error": "browser_dropzone_upload requires the Camofox browser backend.",
+        "error": result.get("error", "Synthetic drop failed. Tried: " + "; ".join(upload_errors)),
     }, ensure_ascii=False)
 
 
@@ -4443,6 +4913,212 @@ def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str
         "element": normalized_ref,
     }
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+def browser_wait(selector: Optional[str] = None, text: Optional[str] = None,
+                 load_state: Optional[str] = None, ms: Optional[int] = None,
+                 task_id: Optional[str] = None) -> str:
+    """Wait for a page condition: element, text, load state, or fixed delay."""
+    if _is_camofox_mode():
+        return json.dumps({
+            "success": False,
+            "error": "browser_wait is not supported on the Camofox backend.",
+        }, ensure_ascii=False)
+
+    effective_task_id = _last_session_key(task_id or "default")
+
+    if selector:
+        condition = f"element {selector}"
+        args = [selector]
+    elif text:
+        condition = f"text {text!r}"
+        args = ["--text", text]
+    elif load_state:
+        if load_state not in ("load", "domcontentloaded", "networkidle"):
+            return json.dumps({
+                "success": False,
+                "error": f"Invalid load_state {load_state!r} (want load, domcontentloaded, or networkidle)",
+            }, ensure_ascii=False)
+        condition = f"load state {load_state}"
+        args = ["--load", load_state]
+    elif ms:
+        capped_ms = min(int(ms), 60_000)
+        condition = f"{capped_ms}ms delay"
+        args = [str(capped_ms)]
+    else:
+        return json.dumps({
+            "success": False,
+            "error": "Provide one of: selector, text, load_state, or ms",
+        }, ensure_ascii=False)
+
+    # The wait itself can legitimately take up to the CLI-side default (30s),
+    # so give the subprocess more headroom than the condition needs.
+    wait_timeout = max(_get_command_timeout(), 45)
+    if ms:
+        wait_timeout = max(wait_timeout, int(ms) // 1000 + 10)
+
+    result = _run_browser_command(effective_task_id, "wait", args, timeout=wait_timeout)
+    if result.get("success"):
+        return json.dumps({"success": True, "waited_for": condition}, ensure_ascii=False)
+    return json.dumps({
+        "success": False,
+        "error": result.get("error", f"Timed out waiting for {condition}"),
+    }, ensure_ascii=False)
+
+
+_BROWSER_READ_MAX_CHARS = 24_000
+
+
+def browser_read(filter: Optional[str] = None, outline: bool = False,
+                 task_id: Optional[str] = None) -> str:
+    """Extract the current page as clean markdown via agent-browser ``read``."""
+    if _is_camofox_mode():
+        return json.dumps({
+            "success": False,
+            "error": "browser_read is not supported on the Camofox backend. Use browser_snapshot.",
+        }, ensure_ascii=False)
+
+    effective_task_id = _last_session_key(task_id or "default")
+    blocked = _blocked_private_page_action(effective_task_id, "read")
+    if blocked is not None:
+        return blocked
+
+    args = []
+    if outline:
+        args.append("--outline")
+    if filter:
+        args += ["--filter", filter]
+
+    result = _run_browser_command(effective_task_id, "read", args)
+    if not result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", "Failed to read page content"),
+        }, ensure_ascii=False)
+
+    data = result.get("data", {}) or {}
+    content = data.get("content") or ""
+    truncated = bool(data.get("truncated"))
+    if len(content) > _BROWSER_READ_MAX_CHARS:
+        content = content[:_BROWSER_READ_MAX_CHARS]
+        truncated = True
+
+    response = {
+        "success": True,
+        "url": data.get("finalUrl") or data.get("url"),
+        "content": content,
+    }
+    if truncated:
+        response["truncated"] = True
+        response["hint"] = "Content truncated. Use the 'filter' parameter to narrow the extraction."
+    return json.dumps(response, ensure_ascii=False)
+
+
+def browser_eval(expression: str, task_id: Optional[str] = None) -> str:
+    """Evaluate JavaScript in the page (SSRF-guarded via _browser_eval)."""
+    if not expression or not expression.strip():
+        return json.dumps({"success": False, "error": "Empty expression"},
+                          ensure_ascii=False)
+    return _browser_eval(expression, task_id)
+
+
+def browser_pdf(path: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """Save the current page as a PDF file."""
+    if _is_camofox_mode():
+        return json.dumps({
+            "success": False,
+            "error": "browser_pdf is not supported on the Camofox backend.",
+        }, ensure_ascii=False)
+
+    effective_task_id = _last_session_key(task_id or "default")
+    target_path = _normalize_download_path(path)
+    if target_path.suffix.lower() != ".pdf":
+        target_path = target_path.with_suffix(".pdf")
+
+    result = _run_browser_command(
+        effective_task_id, "pdf", [str(target_path)],
+        timeout=max(_get_command_timeout(), 60),
+    )
+    if not result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", "Failed to save page as PDF"),
+        }, ensure_ascii=False)
+    if not target_path.exists() or not target_path.is_file():
+        return json.dumps({
+            "success": False,
+            "error": f"PDF reported success but file was not found at {target_path}",
+        }, ensure_ascii=False)
+    return json.dumps({
+        "success": True,
+        "path": str(target_path),
+    }, ensure_ascii=False)
+
+
+def browser_mouse(action: str, ref: Optional[str] = None,
+                  selector: Optional[str] = None,
+                  x: Optional[float] = None, y: Optional[float] = None,
+                  button: Optional[str] = None,
+                  task_id: Optional[str] = None) -> str:
+    """Low-level mouse control: move, down, up, hover."""
+    if _is_camofox_mode():
+        return json.dumps({
+            "success": False,
+            "error": "browser_mouse is not supported on the Camofox backend.",
+        }, ensure_ascii=False)
+
+    effective_task_id = _last_session_key(task_id or "default")
+    blocked = _blocked_private_page_action(effective_task_id, "mouse")
+    if blocked is not None:
+        return blocked
+
+    action = (action or "").strip().lower()
+    if action == "hover":
+        target = _normalize_ref(ref) if ref else (selector or "").strip()
+        if not target:
+            return json.dumps({
+                "success": False,
+                "error": "hover requires a ref or a selector",
+            }, ensure_ascii=False)
+        result = _run_browser_command(effective_task_id, "hover", [target])
+        if result.get("success"):
+            return json.dumps({"success": True, "action": "hover", "element": target},
+                              ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", f"Failed to hover {target}"),
+        }, ensure_ascii=False)
+
+    if action == "move":
+        px, py, err = _resolve_viewport_point(
+            effective_task_id, ref=ref, selector=selector, x=x, y=y)
+        if err:
+            return json.dumps({"success": False, "error": err}, ensure_ascii=False)
+        result = _run_browser_command(
+            effective_task_id, "mouse", ["move", _fmt_coord(px), _fmt_coord(py)])
+        if result.get("success"):
+            return json.dumps({"success": True, "action": "move", "x": px, "y": py},
+                              ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", "Mouse move failed"),
+        }, ensure_ascii=False)
+
+    if action in ("down", "up"):
+        args = [action] + ([button] if button else [])
+        result = _run_browser_command(effective_task_id, "mouse", args)
+        if result.get("success"):
+            return json.dumps({"success": True, "action": action,
+                               "button": button or "left"}, ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", f"Mouse {action} failed"),
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "success": False,
+        "error": f"Unknown mouse action {action!r} (want move, down, up, or hover)",
+    }, ensure_ascii=False)
 
 
 def _maybe_start_recording(task_id: str):
@@ -5568,4 +6244,68 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="📥",
+)
+registry.register(
+    name="browser_wait",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_wait"],
+    handler=lambda args, **kw: browser_wait(
+        selector=args.get("selector"),
+        text=args.get("text"),
+        load_state=args.get("load_state"),
+        ms=args.get("ms"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="⏳",
+)
+registry.register(
+    name="browser_read",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_read"],
+    handler=lambda args, **kw: browser_read(
+        filter=args.get("filter"),
+        outline=args.get("outline", False),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📖",
+)
+registry.register(
+    name="browser_eval",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_eval"],
+    handler=lambda args, **kw: browser_eval(
+        expression=args.get("expression", ""),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🧪",
+)
+registry.register(
+    name="browser_pdf",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_pdf"],
+    handler=lambda args, **kw: browser_pdf(
+        path=args.get("path"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📄",
+)
+registry.register(
+    name="browser_mouse",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_mouse"],
+    handler=lambda args, **kw: browser_mouse(
+        action=args.get("action", ""),
+        ref=args.get("ref"),
+        selector=args.get("selector"),
+        x=args.get("x"),
+        y=args.get("y"),
+        button=args.get("button"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🖱️",
 )
