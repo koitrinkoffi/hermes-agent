@@ -4785,8 +4785,80 @@ def browser_dropzone_upload(selector: Optional[str] = None, path: Optional[str] 
 
     effective_task_id = _last_session_key(task_id or "default")
 
-    # Dropzone widgets almost always wrap a hidden <input type=file>. Try that
-    # input first, scoped to the dropzone so we never upload to an unrelated
+    # Dropzone.js path (first): a real Dropzone widget keeps its <input
+    # type=file> (class ``dz-hidden-input``) on document.body — NOT inside the
+    # dropzone element — and ignores synthetic drop events, so the scoped-input
+    # and synthetic-drop paths below both miss it. Detect the Dropzone instance
+    # for the selector (the element itself, a nested ``.dropzone``, or
+    # ``el.dropzone``), tag ITS hidden input, and upload to that. Verified
+    # against Portad's justificatif dropzone.
+    tag_js = (
+        "(() => {"
+        "if (typeof window.Dropzone === 'undefined') return JSON.stringify({ok:false, reason:'no-lib'});"
+        f"const root = document.querySelector({json.dumps(drop_selector)});"
+        "if (!root) return JSON.stringify({ok:false, reason:'no-selector'});"
+        "let el = (root.classList && root.classList.contains('dropzone')) ? root : root.querySelector('.dropzone');"
+        "let dz = null;"
+        "try { if (el && window.Dropzone.forElement) dz = window.Dropzone.forElement(el); } catch(e){}"
+        "if (!dz && root.dropzone) dz = root.dropzone;"
+        "if (!dz && el && el.dropzone) dz = el.dropzone;"
+        "if (!dz) return JSON.stringify({ok:false, reason:'no-instance'});"
+        "const inp = dz.hiddenFileInput;"
+        "if (!inp) return JSON.stringify({ok:false, reason:'no-hidden-input'});"
+        "const prev = document.getElementById('hermes_dz_upload_target');"
+        "if (prev && prev !== inp) prev.removeAttribute('id');"
+        "inp.id = 'hermes_dz_upload_target';"
+        "inp.style.cssText = 'display:block;visibility:visible;opacity:0;position:fixed;left:0;top:0;width:1px;height:1px';"
+        "return JSON.stringify({ok:true});"
+        "})()"
+    )
+    tag_result = _run_browser_command(effective_task_id, "eval", [tag_js])
+    if tag_result.get("success"):
+        try:
+            tag_outcome = json.loads((tag_result.get("data", {}) or {}).get("result") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            tag_outcome = {}
+        if tag_outcome.get("ok"):
+            up = _run_browser_command(
+                effective_task_id, "upload",
+                ["#hermes_dz_upload_target", *normalized_paths],
+                timeout=max(_get_command_timeout(), 60),
+            )
+            if up.get("success"):
+                # Give Dropzone a moment to run its change handler (accept +,
+                # if autoProcessQueue, upload). Report the last file's status.
+                status_js = (
+                    "(() => {"
+                    f"const root = document.querySelector({json.dumps(drop_selector)});"
+                    "let el = (root && root.classList && root.classList.contains('dropzone')) ? root : (root && root.querySelector('.dropzone'));"
+                    "let dz = null; try { dz = window.Dropzone.forElement(el); } catch(e){}"
+                    "if (!dz && root && root.dropzone) dz = root.dropzone;"
+                    "const f = dz && dz.files && dz.files[dz.files.length-1];"
+                    "return JSON.stringify({n: dz? dz.files.length:0, name: f?f.name:null, status: f?f.status:null});"
+                    "})()"
+                )
+                import time as _t
+                dz_status = {}
+                for _ in range(10):
+                    _t.sleep(0.6)
+                    sres = _run_browser_command(effective_task_id, "eval", [status_js])
+                    try:
+                        dz_status = json.loads((sres.get("data", {}) or {}).get("result") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        dz_status = {}
+                    if dz_status.get("status") in ("success", "error"):
+                        break
+                return json.dumps({
+                    "success": dz_status.get("status") != "error",
+                    "element": drop_selector,
+                    "uploaded_paths": normalized_paths,
+                    "method": "dropzone_js",
+                    "dropzone_status": dz_status.get("status"),
+                    "dropzone_file": dz_status.get("name"),
+                }, ensure_ascii=False)
+
+    # Dropzone widgets sometimes wrap a hidden <input type=file>. Try that
+    # input, scoped to the dropzone so we never upload to an unrelated
     # file input elsewhere on the page. If the selector IS itself a file input,
     # target it directly. No page-wide fallback — a wrong-target upload is
     # worse than falling through to the synthetic drop below.
