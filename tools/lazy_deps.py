@@ -240,6 +240,21 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
     "tool.trace_upload": ("huggingface-hub==1.2.3",),
+
+    # ─── Plugins ───────────────────────────────────────────────────────────
+    # apple_icloud user plugin — CalDAV/CardDAV access to iCloud Calendar,
+    # Reminders and Contacts. icalendar builds/parses VEVENT/VTODO;
+    # recurring-ical-events (+ its x-wr-timezone helper) expands RRULE series
+    # over a window; tzdata provides deterministic IANA zones (icalendar 7
+    # requires tzdata>=2025.3). HTTP + XML ride the core `requests` + stdlib
+    # ElementTree, so no extra HTTP/XML deps. recurring-ical-events caps
+    # icalendar<8, so the 7.2.0 pin stays inside its supported range.
+    "plugin.icloud": (
+        "icalendar==7.2.0",
+        "recurring-ical-events==3.8.2",
+        "x-wr-timezone==2.0.1",
+        "tzdata==2026.3",
+    ),
 }
 
 
