@@ -3502,7 +3502,13 @@ class AIAgent:
 
         # 3. Clean browser daemon sessions
         try:
-            cleanup_browser(task_id)
+            # A persistent local browser profile must survive agent close: the
+            # background skill-review agent shares the main session_id, so its
+            # close() would otherwise tear down the browser right after every
+            # turn that used it. The idle reaper (browser.inactivity_timeout)
+            # and cleanup_all_browsers (gateway shutdown) still reap it.
+            if not is_persistent_browser_session(task_id):
+                cleanup_browser(task_id)
         except Exception:
             pass
 
