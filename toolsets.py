@@ -77,6 +77,14 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Credential vault (localpass plugin) — pinned core so the vault tools stay
+    # visible in the model schema instead of being deferred behind tool_search.
+    # The agent must consult the vault before asking Koitrin for any login, and
+    # a deferred toolset it can't see by name defeats that (observed: repeated
+    # CLI / skill_view / tool_describe fumbles reaching for localpass). Delete
+    # stays deferred (destructive; still reachable via tool_search when needed).
+    "localpass_get", "localpass_search", "localpass_store",
+    "localpass_update", "localpass_status",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
