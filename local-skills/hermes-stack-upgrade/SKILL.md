@@ -134,6 +134,28 @@ at any ✗ or exit code 2.
   share the auto-activate-newest-tab bug that the blank-tab steer mod works
   around. Do **not** bump this dependency during a routine upgrade merge
   without deliberately re-validating the local mods against the new version.
+- **KNOWN upcoming conflict (as of 2026-07-19, 1138 commits behind upstream/main)**:
+  upstream commit `29899c2aa` ("Fix headed browser sessions being killed after
+  every turn") independently fixes the SAME turn-boundary browser-kill bug our
+  `is_persistent_browser_session` exemption fixes, in the exact same two spots:
+  - `agent/chat_completion_helpers.py::cleanup_task_resources` — upstream skips
+    `cleanup_browser` when `AGENT_BROWSER_HEADED`/`browser.headed` is set; we
+    skip it when the session is a persistent local profile. **Resolution: keep
+    BOTH conditions, OR'd together** (skip if persistent-profile OR headed),
+    don't let one clobber the other.
+  - `tools/browser_tool.py::_run_browser_command`, the local-mode `else`
+    branch — upstream adds `_is_headed_mode()` + a bare `--headed` append right
+    where our persistent-profile branch already appends `--profile` and its
+    own `local_settings["headed"]` check. These are two different config keys
+    (upstream's global `browser.headed` vs our `browser.local.headed`) — decide
+    deliberately whether to keep both, or fold upstream's into ours, rather
+    than merging on autopilot.
+  - Our `run_agent.py::Agent.close()` exemption (commit `47e861826`) has **no**
+    upstream equivalent found (checked `git log hermes-mods..upstream/main --
+    run_agent.py` for browser/cleanup/close hits) — should merge clean, but
+    re-check `is_persistent_browser_session` is still importable from
+    `tools.browser_tool` after the browser_tool.py merge lands, since it's a
+    Python-level dependency across the conflict.
 - **Don't run bare `hermes update`** between upgrades — it deactivates your mods.
 
 ## Verification
