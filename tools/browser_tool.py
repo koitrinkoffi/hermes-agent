@@ -2168,33 +2168,6 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
-        "name": "browser_wait",
-        "description": "Wait for the page to reach a condition before continuing: an element to appear, text to show up, a load state, or a fixed delay. Use after clicks/navigation on dynamic (SPA) pages instead of re-snapshotting and hoping the page is ready.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "selector": {
-                    "type": "string",
-                    "description": "Wait for this element to appear (CSS selector or snapshot ref like '@e5')"
-                },
-                "text": {
-                    "type": "string",
-                    "description": "Wait for this text to appear anywhere on the page (substring match)"
-                },
-                "load_state": {
-                    "type": "string",
-                    "enum": ["load", "domcontentloaded", "networkidle"],
-                    "description": "Wait for a page load state ('networkidle' = no network activity)"
-                },
-                "ms": {
-                    "type": "integer",
-                    "description": "Wait a fixed number of milliseconds (last resort; prefer the condition-based modes)"
-                }
-            },
-            "required": []
-        }
-    },
-    {
         "name": "browser_eval",
         "description": "Execute a JavaScript expression in the current page and return its result. Powerful escape hatch: extract structured data in one call, scroll inner containers, trigger events the accessibility tree can't reach. Use sparingly, prefer dedicated browser tools when they suffice.",
         "parameters": {
@@ -5030,57 +5003,6 @@ def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_wait(selector: Optional[str] = None, text: Optional[str] = None,
-                 load_state: Optional[str] = None, ms: Optional[int] = None,
-                 task_id: Optional[str] = None) -> str:
-    """Wait for a page condition: element, text, load state, or fixed delay."""
-    if _is_camofox_mode():
-        return json.dumps({
-            "success": False,
-            "error": "browser_wait is not supported on the Camofox backend.",
-        }, ensure_ascii=False)
-
-    effective_task_id = _last_session_key(task_id or "default")
-
-    if selector:
-        condition = f"element {selector}"
-        args = [selector]
-    elif text:
-        condition = f"text {text!r}"
-        args = ["--text", text]
-    elif load_state:
-        if load_state not in ("load", "domcontentloaded", "networkidle"):
-            return json.dumps({
-                "success": False,
-                "error": f"Invalid load_state {load_state!r} (want load, domcontentloaded, or networkidle)",
-            }, ensure_ascii=False)
-        condition = f"load state {load_state}"
-        args = ["--load", load_state]
-    elif ms:
-        capped_ms = min(int(ms), 60_000)
-        condition = f"{capped_ms}ms delay"
-        args = [str(capped_ms)]
-    else:
-        return json.dumps({
-            "success": False,
-            "error": "Provide one of: selector, text, load_state, or ms",
-        }, ensure_ascii=False)
-
-    # The wait itself can legitimately take up to the CLI-side default (30s),
-    # so give the subprocess more headroom than the condition needs.
-    wait_timeout = max(_get_command_timeout(), 45)
-    if ms:
-        wait_timeout = max(wait_timeout, int(ms) // 1000 + 10)
-
-    result = _run_browser_command(effective_task_id, "wait", args, timeout=wait_timeout)
-    if result.get("success"):
-        return json.dumps({"success": True, "waited_for": condition}, ensure_ascii=False)
-    return json.dumps({
-        "success": False,
-        "error": result.get("error", f"Timed out waiting for {condition}"),
-    }, ensure_ascii=False)
-
-
 def browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JavaScript in the page (SSRF-guarded via _browser_eval)."""
     if not expression or not expression.strip():
@@ -6343,20 +6265,6 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="📥",
-)
-registry.register(
-    name="browser_wait",
-    toolset="browser",
-    schema=_BROWSER_SCHEMA_MAP["browser_wait"],
-    handler=lambda args, **kw: browser_wait(
-        selector=args.get("selector"),
-        text=args.get("text"),
-        load_state=args.get("load_state"),
-        ms=args.get("ms"),
-        task_id=kw.get("task_id"),
-    ),
-    check_fn=check_browser_requirements,
-    emoji="⏳",
 )
 registry.register(
     name="browser_eval",
