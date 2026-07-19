@@ -1,28 +1,35 @@
 ---
 name: hermes-stack-upgrade
-description: Safely upgrade the Hermes agent and the camofox browser server while preserving local mods (fork workflow), with conflict-aware merges, an end-to-end smoke gate, and one-command rollback.
-version: 1.0.0
+description: Safely upgrade the Hermes agent while preserving local mods (fork workflow), with conflict-aware merges, an end-to-end smoke gate, and one-command rollback.
+version: 2.0.0
 author: Koitrin KOFFI
 license: MIT
 platforms: [linux]
 metadata:
   hermes:
-    tags: [Maintenance, Upgrade, Git, Fork, Browser, Camofox]
+    tags: [Maintenance, Upgrade, Git, Fork, Browser]
     related_skills: [github-auth]
 ---
 
 # Hermes Stack Upgrade
 
-Upgrades two coupled repos at once — the Hermes agent (`~/.hermes/hermes-agent`)
-and the camofox browser server (`~/camofox`) — without losing your local
-modifications, using the **fork workflow**: `origin` = your GitHub fork (carries
-your mods), `upstream` = the official repo. Your mods live on the **`hermes-mods`**
-branch in **both** repos (hermes and camofox alike); each repo's `main`/`master`
-stays a clean upstream mirror. Normal operation runs checked out on `hermes-mods`.
+Upgrades the Hermes agent (`~/.hermes/hermes-agent`) without losing your local
+modifications, using the **fork workflow**: `origin` = your GitHub fork
+(carries your mods), `upstream` = the official repo. Your mods live on the
+**`hermes-mods`** branch; `main` stays a clean upstream mirror. Normal
+operation runs checked out on `hermes-mods`.
+
+The browser backend (agent-browser CLI + Helium) is an npm dependency pinned
+in `package.json`, not a separate coupled repo — it upgrades via the normal
+`pip install -e` step below, not a second merge. **Camofox is not part of this
+machine's stack** (disabled 2026-07-17, replaced by agent-browser + a
+persistent Helium profile) — this skill no longer touches `~/camofox` or the
+`camofox.service` unit. If Camofox is ever re-enabled, this skill would need
+its coupled-repo handling re-added; until then, do not resurrect it here.
 
 ## When to Use
 
-- The user asks to **update / upgrade Hermes** (or "update the browser stack").
+- The user asks to **update / upgrade Hermes**.
 - After seeing "update available" — instead of bare `hermes update`, which would
   switch HEAD to the mods-free `main` and **deactivate your mods**.
 
@@ -45,31 +52,31 @@ drives it and verifies the result.
 Scripts live in `${HERMES_SKILL_DIR}/scripts`. Run them in order. Stop and think
 at any ✗ or exit code 2.
 
-1. **Preflight** — verify fork remotes, record pre-merge SHAs for rollback:
+1. **Preflight** — verify fork remotes, record the pre-merge SHA for rollback:
    ```bash
    bash ${HERMES_SKILL_DIR}/scripts/preflight.sh
    ```
    If it fails, the one-time setup below hasn't been done (or `origin` still
    points at the official repo). Fix that first.
 
-2. **Merge upstream into each repo.** Hermes first, then camofox:
+2. **Merge upstream into hermes-mods:**
    ```bash
    bash ${HERMES_SKILL_DIR}/scripts/sync_repo.sh "$HOME/.hermes/hermes-agent" hermes-mods main
-   bash ${HERMES_SKILL_DIR}/scripts/sync_repo.sh "$HOME/camofox" hermes-mods master
    ```
    - **Exit 0** → clean merge, continue.
    - **Exit 2** → conflicts. **YOU (the agent) resolve them**: open each listed
-     file, keep BOTH the upstream change and the local mod (the upload endpoint /
-     client, the desktop-fingerprint mod). Then complete the merge:
+     file, keep BOTH the upstream change and the local mod. Then complete the
+     merge:
      ```bash
-     git -C <repo> add -A && git -C <repo> commit --no-edit
+     git -C "$HOME/.hermes/hermes-agent" add -A && git -C "$HOME/.hermes/hermes-agent" commit --no-edit
      ```
-     Re-read the diff against `upstream/<branch>` to confirm the mod survived.
+     Re-read the diff against `upstream/main` to confirm the mod survived.
      If the file diverged too far to merge cleanly, prefer **re-applying** the
      mod against current upstream over forcing a messy merge.
 
 3. **Reinstall Hermes deps** for the newly merged code (the merge may have
-   changed dependencies):
+   changed dependencies, including the pinned `agent-browser` npm version —
+   see the Pitfalls note on that):
    ```bash
    "$HOME/.hermes/hermes-agent/venv/bin/python" -m pip install -e "$HOME/.hermes/hermes-agent[all]"
    ```
@@ -89,7 +96,7 @@ at any ✗ or exit code 2.
    bash ${HERMES_SKILL_DIR}/scripts/push_backups.sh
    bash ${HERMES_SKILL_DIR}/scripts/deploy_self.sh
    ```
-   **On red → roll back** (forks untouched), then investigate:
+   **On red → roll back** (fork untouched), then investigate:
    ```bash
    bash ${HERMES_SKILL_DIR}/scripts/rollback.sh
    ```
@@ -97,39 +104,41 @@ at any ✗ or exit code 2.
 ## One-Time Setup (already done on this machine; documented for a fresh rebuild)
 
 1. Install + auth GitHub CLI: `gh auth login` (HTTPS).
-2. Fork both repos and rewire remotes:
+2. Fork the repo and rewire remotes:
    ```bash
    gh repo fork NousResearch/hermes-agent --clone=false --remote=false
    cd ~/.hermes/hermes-agent
    git remote rename origin upstream
    git remote add origin https://github.com/<you>/hermes-agent.git
-
-   gh repo fork jo-inc/camofox-browser --clone=false --remote=false
-   cd ~/camofox
-   git remote rename origin upstream
-   git remote add origin https://github.com/<you>/camofox-browser.git
    ```
-3. Put your mods on the `hermes-mods` branch in **both** repos (`hermes-mods` for
-   hermes and camofox alike; each `main`/`master` stays a clean upstream mirror)
-   and push to your forks. Stay checked out on `hermes-mods` for normal operation.
+3. Put your mods on the `hermes-mods` branch and push to your fork. Stay
+   checked out on `hermes-mods` for normal operation.
 4. Deploy this skill: `bash <canonical>/scripts/deploy_self.sh`.
 
 ## Pitfalls
 
-- **Never `git push --force`** to the forks — they are your only off-machine
+- **Never `git push --force`** to the fork — it is your only off-machine
   backup. The merge workflow never needs it.
 - **Push backups only after the smoke gate is green** (`push_backups.sh` is step
   6a) so the fork never points at a broken state.
-- **`browser_tool.py` / `server.js` are hot upstream** — expect conflicts there
-  every few upgrades; that's the agent-resolution step, not a failure.
+- **`browser_tool.py` is hot upstream AND heavily locally modified** (persistent
+  profile, blank-tab steer, turn-boundary/close() exemptions, browser_read/
+  browser_wait removed) — expect conflicts there on nearly every upgrade;
+  that's the agent-resolution step, not a failure. Read the full local diff
+  against `upstream/main` before resolving so you don't accidentally re-add a
+  removed tool or drop an exemption.
+- **agent-browser version is pinned for a reason** (`package.json` `^0.26.0`,
+  and the resolved binary MUST match — see `project-hermes-agent-browser-migration`
+  memory): 0.32.1 changes the CLI's JSON output schema (adds a `lifecycle`
+  object) which breaks `browser_tool.py`'s parsing, and both 0.26.0 and 0.32.1
+  share the auto-activate-newest-tab bug that the blank-tab steer mod works
+  around. Do **not** bump this dependency during a routine upgrade merge
+  without deliberately re-validating the local mods against the new version.
 - **Don't run bare `hermes update`** between upgrades — it deactivates your mods.
-- The live smoke needs the **running systemd camofox**; `restart_services.sh`
-  must succeed (health check) before `smoke.sh`.
 
 ## Verification
 
-- `smoke.sh` exits 0 (all three layers pass).
+- `smoke.sh` exits 0 (both layers pass).
 - `git -C ~/.hermes/hermes-agent log --oneline -1` shows your mod commit reachable
-  from `hermes-mods`; `git -C ~/camofox log --oneline -1` likewise on `hermes-mods`.
-- `gh repo view <you>/hermes-agent` and `<you>/camofox-browser` reflect the new
-  push timestamps.
+  from `hermes-mods`.
+- `gh repo view <you>/hermes-agent` reflects the new push timestamp.

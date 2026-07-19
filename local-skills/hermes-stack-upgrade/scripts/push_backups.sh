@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Push the upgraded mods branches to the forks. Run ONLY after smoke.sh is green,
+# Push the upgraded mods branch to the fork. Run ONLY after smoke.sh is green,
 # so the backup always points at a known-good state. No force-push.
 set -uo pipefail
 
 HERMES_REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
-CAMOFOX_REPO="${CAMOFOX_REPO:-$HOME/camofox}"
 
 push() {
   local dir="$1" branch="$2"
@@ -18,5 +17,4 @@ push() {
 }
 
 push "$HERMES_REPO" hermes-mods
-push "$CAMOFOX_REPO" hermes-mods
-echo "✓ backups updated"
+echo "✓ backup updated"

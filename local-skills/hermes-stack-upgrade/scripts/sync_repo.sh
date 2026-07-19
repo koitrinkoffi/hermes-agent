@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Merge the latest upstream into a repo's mods branch (the agreed merge-based,
-# non-force-push integration). Generic over both repos.
+# non-force-push integration). Generic over any repo on this pattern.
 #
 # Usage: sync_repo.sh <repo_dir> <mods_branch> <upstream_branch>
 #   e.g. sync_repo.sh ~/.hermes/hermes-agent hermes-mods main
-#        sync_repo.sh ~/camofox hermes-mods master
 #
 # Exit 0 = clean merge (or already up to date).
 # Exit 2 = merge conflicts left in the tree — the AGENT resolves them, then runs

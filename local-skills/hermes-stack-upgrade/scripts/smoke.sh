@@ -1,41 +1,40 @@
 #!/usr/bin/env bash
-# Success gate: prove the browser_upload feature still works end-to-end after the
-# upgrade. Three layers, fail fast on the first failure.
+# Success gate: prove browser automation still works end-to-end after the
+# upgrade. Two layers, fail fast on the first failure.
 #   1. hermes unit tests (fast, no browser)
-#   2. camofox e2e (real browser)
-#   3. live smoke: real browser_upload through the RUNNING systemd camofox
-#      (the only layer that catches hermes-client <-> camofox-server version skew)
+#   2. live smoke: real agent-browser + Helium upload, through a THROWAWAY
+#      session/profile (never touches the live persistent Hermes browser
+#      session at ~/.hermes/browser_profile — see the persistent-browser
+#      turn/close exemptions in project-hermes-agent-browser-migration memory;
+#      this smoke test must not compete with or tear down that session).
 set -uo pipefail
 
 HERMES_REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
-CAMOFOX_REPO="${CAMOFOX_REPO:-$HOME/camofox}"
 
-echo "=== [1/3] hermes unit tests ==="
+echo "=== [1/2] hermes unit tests ==="
 "$HERMES_REPO/venv/bin/python" -m pytest \
   "$HERMES_REPO/tests/tools/test_browser_tab_upload_download.py" -q || { echo "✗ unit tests failed"; exit 1; }
 
-echo "=== [2/3] camofox e2e (upload) ==="
-# Run hermetic: strip any ambient camofox auth keys (the Hermes gateway env
-# carries CAMOFOX_API_KEY so it can call camofox). If they leak into the e2e
-# test's own server it enforces auth, and the unauthenticated test client gets
-# 403 instead of the expected 400/success. Stripping them => keyless server =>
-# loopback auth, deterministic regardless of who launched the upgrade.
-run_e2e() { ( cd "$CAMOFOX_REPO" && env -u CAMOFOX_API_KEY -u CAMOFOX_ACCESS_KEY -u CAMOFOX_ADMIN_KEY \
-    NODE_OPTIONS='--experimental-vm-modules' \
-    npx jest --config jest.config.e2e.cjs --runInBand --forceExit upload ); }
-# Real-browser e2e is timing-sensitive under load; retry once so a single flaky
-# run doesn't trigger an unnecessary rollback. A genuine break fails both times.
-if ! run_e2e; then
-  echo "⚠ camofox e2e failed once (real-browser flakiness?) — retrying once..."
-  run_e2e || { echo "✗ camofox e2e failed twice"; exit 1; }
+echo "=== [2/2] live smoke: agent-browser + Helium (throwaway profile) ==="
+# Pull just the one var we need out of ~/.hermes/.env by hand rather than
+# sourcing the whole file — it contains unquoted {placeholder} values (e.g.
+# HERMES_LOCAL_STT_COMMAND) that are safe for python-dotenv but not for a
+# literal `bash -c '. file'`.
+ENV_FILE="$HOME/.hermes/.env"
+if [ -f "$ENV_FILE" ]; then
+  ab_path="$(grep -m1 '^AGENT_BROWSER_EXECUTABLE_PATH=' "$ENV_FILE" | cut -d= -f2-)"
+  [ -n "$ab_path" ] && export AGENT_BROWSER_EXECUTABLE_PATH="$ab_path"
 fi
 
-echo "=== [3/3] live smoke through running camofox ==="
-# Source CAMOFOX_URL / CAMOFOX_API_KEY from the running service's env file.
-[ -f "$CAMOFOX_REPO/.env" ] && set -a && . "$CAMOFOX_REPO/.env" && set +a
-export CAMOFOX_URL="${CAMOFOX_URL:-http://localhost:9377}"
+AB="$HERMES_REPO/node_modules/agent-browser/bin/agent-browser-linux-x64"
+[ -x "$AB" ] || AB="npx --prefix $HERMES_REPO agent-browser"
 
 SITE="$(mktemp -d)"
+SOCK="$(mktemp -d /tmp/hermes-smoke-sock.XXXXXX)"
+PROFILE="$SITE/profile"
+export AGENT_BROWSER_SOCKET_DIR="$SOCK"
+session="smoke$$"
+
 cat > "$SITE/index.html" <<'HTML'
 <!DOCTYPE html><html><head><title>Smoke</title></head><body>
 <h1>Smoke</h1><input type="file" id="file-input" multiple /><h2 id="result">no file</h2>
@@ -48,29 +47,23 @@ echo "smoke-$(date +%s)" > "$SITE/smoke_upload.txt"
 ( cd "$SITE" && python3 -m http.server 8799 >/dev/null 2>&1 & echo $! > "$SITE/pid" )
 sleep 1
 
-"$HERMES_REPO/venv/bin/python" - "$SITE" <<'PY'
-import sys, json, time
-site = sys.argv[1]
-sys.path.insert(0, __import__("os").path.expanduser("~/.hermes/hermes-agent"))
-import tools.browser_tool as bt
-assert bt._is_camofox_mode(), "camofox mode not active"
-tid = "stack-upgrade-smoke"
-bt.browser_navigate("http://localhost:8799/", task_id=tid); time.sleep(1)
-up = json.loads(bt.browser_upload(ref="input[type=file]", path=f"{site}/smoke_upload.txt", task_id=tid))
-assert up.get("success"), f"upload failed: {up}"
-time.sleep(1)
-snap = bt.browser_snapshot(task_id=tid)
-assert "uploaded: smoke_upload.txt" in snap, "uploaded filename not reflected in page"
-try:
-    from tools.browser_camofox import camofox_close; camofox_close(tid)
-except Exception:
-    pass
-print("✓ live smoke passed")
-PY
-rc=$?
-kill "$(cat "$SITE/pid" 2>/dev/null)" 2>/dev/null
-rm -rf "$SITE"
-[ "$rc" -eq 0 ] || { echo "✗ live smoke failed"; exit 1; }
+cleanup() {
+  $AB --session "$session" --profile "$PROFILE" --json close >/dev/null 2>&1 || true
+  kill "$(cat "$SITE/pid" 2>/dev/null)" 2>/dev/null || true
+  rm -rf "$SITE" "$SOCK"
+}
+trap cleanup EXIT
 
+open_result="$($AB --session "$session" --profile "$PROFILE" --json open http://localhost:8799/)"
+echo "$open_result" | grep -q '"success":true' || { echo "✗ open failed: $open_result"; exit 1; }
+
+upload_result="$($AB --session "$session" --profile "$PROFILE" --json upload 'input[type=file]' "$SITE/smoke_upload.txt")"
+echo "$upload_result" | grep -q '"success":true' || { echo "✗ upload failed: $upload_result"; exit 1; }
+
+sleep 1
+text_result="$($AB --session "$session" --profile "$PROFILE" --json get text '#result')"
+echo "$text_result" | grep -q "uploaded: smoke_upload.txt" || { echo "✗ uploaded filename not reflected in page: $text_result"; exit 1; }
+
+echo "✓ live smoke passed"
 echo
 echo "✓✓ all smoke layers passed"
