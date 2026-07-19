@@ -1956,12 +1956,10 @@ BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_mouse_wheel",
         "description": (
-            "Scroll a specific nested/inner scrollable container with a real mouse "
-            "wheel event, targeted at an element ref (preferred), explicit x/y "
-            "viewport coordinates, or the viewport centre. Use this when "
-            "browser_scroll (page-level) does not move a virtualised feed, chat/message "
-            "list, dropdown, or map that only scrolls when the pointer is over it. "
-            "Positive deltaY scrolls down, negative up. Requires browser_navigate first."
+            "Mouse-wheel scroll a nested scrollable container (virtualised feed, "
+            "chat list, dropdown, map) that browser_scroll doesn't move. Target an "
+            "element ref, x/y, or the viewport centre; positive delta_y scrolls down. "
+            "Requires browser_navigate first."
         ),
         "parameters": {
             "type": "object",
@@ -1978,16 +1976,10 @@ BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_drag",
         "description": (
-            "Perform a real mouse drag (press -> move -> release) for drag-and-drop, "
-            "sliders, and CAPTCHAs (slider/puzzle), or canvas widgets where clicking/typing "
-            "isn't enough. Give a START and an END point, each EITHER as a snapshot ref "
-            "(from_ref/to_ref, e.g. '@e5'), a CSS selector (from_selector/to_selector, dragged "
-            "from/to the element center), OR absolute viewport pixel coordinates "
-            "(from_x/from_y, to_x/to_y — get these from element rects via browser_console "
-            "getBoundingClientRect when targets have no ref, e.g. a timeline/canvas cell). "
-            "Optional 'waypoints' (list of {x,y}) define an explicit path between press and "
-            "release for curved slider captchas; 'humanize' adds eased motion with slight jitter. "
-            "Requires browser_navigate first."
+            "Real mouse drag (press -> move -> release) for drag-and-drop, sliders, "
+            "slider/puzzle CAPTCHAs, and canvas widgets. Start and end points each given "
+            "as a snapshot ref, CSS selector, or viewport x/y coords. Optional waypoints "
+            "for curved paths; humanize for eased motion. Requires browser_navigate first."
         ),
         "parameters": {
             "type": "object",
@@ -2197,24 +2189,6 @@ BROWSER_TOOL_SCHEMAS = [
                 "ms": {
                     "type": "integer",
                     "description": "Wait a fixed number of milliseconds (last resort; prefer the condition-based modes)"
-                }
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "browser_read",
-        "description": "Extract the current page's content as clean markdown (readability-style). Much more token-efficient than browser_snapshot when the goal is to READ content (an article, a listing, a profile) rather than interact with the page. Requires browser_navigate first.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "filter": {
-                    "type": "string",
-                    "description": "Optional text filter: only return content sections matching this text"
-                },
-                "outline": {
-                    "type": "boolean",
-                    "description": "Return only the page outline (headings structure) instead of full content"
                 }
             },
             "required": []
@@ -5107,54 +5081,6 @@ def browser_wait(selector: Optional[str] = None, text: Optional[str] = None,
     }, ensure_ascii=False)
 
 
-_BROWSER_READ_MAX_CHARS = 24_000
-
-
-def browser_read(filter: Optional[str] = None, outline: bool = False,
-                 task_id: Optional[str] = None) -> str:
-    """Extract the current page as clean markdown via agent-browser ``read``."""
-    if _is_camofox_mode():
-        return json.dumps({
-            "success": False,
-            "error": "browser_read is not supported on the Camofox backend. Use browser_snapshot.",
-        }, ensure_ascii=False)
-
-    effective_task_id = _last_session_key(task_id or "default")
-    blocked = _blocked_private_page_action(effective_task_id, "read")
-    if blocked is not None:
-        return blocked
-
-    args = []
-    if outline:
-        args.append("--outline")
-    if filter:
-        args += ["--filter", filter]
-
-    result = _run_browser_command(effective_task_id, "read", args)
-    if not result.get("success"):
-        return json.dumps({
-            "success": False,
-            "error": result.get("error", "Failed to read page content"),
-        }, ensure_ascii=False)
-
-    data = result.get("data", {}) or {}
-    content = data.get("content") or ""
-    truncated = bool(data.get("truncated"))
-    if len(content) > _BROWSER_READ_MAX_CHARS:
-        content = content[:_BROWSER_READ_MAX_CHARS]
-        truncated = True
-
-    response = {
-        "success": True,
-        "url": data.get("finalUrl") or data.get("url"),
-        "content": content,
-    }
-    if truncated:
-        response["truncated"] = True
-        response["hint"] = "Content truncated. Use the 'filter' parameter to narrow the extraction."
-    return json.dumps(response, ensure_ascii=False)
-
-
 def browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JavaScript in the page (SSRF-guarded via _browser_eval)."""
     if not expression or not expression.strip():
@@ -6431,18 +6357,6 @@ registry.register(
     ),
     check_fn=check_browser_requirements,
     emoji="⏳",
-)
-registry.register(
-    name="browser_read",
-    toolset="browser",
-    schema=_BROWSER_SCHEMA_MAP["browser_read"],
-    handler=lambda args, **kw: browser_read(
-        filter=args.get("filter"),
-        outline=args.get("outline", False),
-        task_id=kw.get("task_id"),
-    ),
-    check_fn=check_browser_requirements,
-    emoji="📖",
 )
 registry.register(
     name="browser_eval",

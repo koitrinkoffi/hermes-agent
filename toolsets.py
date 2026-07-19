@@ -56,7 +56,7 @@ _HERMES_CORE_TOOLS = [
     "browser_press", "browser_get_images",
     "browser_vision", "browser_dialog",
     "browser_download", "browser_dropzone_upload",
-    "browser_mouse", "browser_mouse_wheel", "browser_pdf", "browser_read",
+    "browser_mouse", "browser_mouse_wheel", "browser_pdf",
     "browser_tab", "browser_upload", "browser_wait",
     # Text-to-speech
     "text_to_speech",
