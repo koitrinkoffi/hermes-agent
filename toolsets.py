@@ -43,11 +43,21 @@ _HERMES_CORE_TOOLS = [
     "vision_analyze", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
-    # Browser automation
+    # Browser automation — the everyday-driving tools are pinned core so none
+    # of THEM is deferred behind tool_search (a deferred wheel/tab/upload tool
+    # it can't find falls back to a weaker one, e.g. page-level scroll on a
+    # virtualised feed). browser_eval/browser_cdp/browser_console are
+    # deliberately left OUT (2026-07-19): once pinned, Hermes reached for raw
+    # JS (browser_eval) even where browser_click/type/scroll would do — the
+    # tool_search friction now nudges it back to the simple tools first,
+    # while eval/cdp/console stay reachable for the cases that really need them.
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_drag", "browser_back",
     "browser_press", "browser_get_images",
-    "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    "browser_vision", "browser_dialog",
+    "browser_download", "browser_dropzone_upload",
+    "browser_mouse", "browser_mouse_wheel", "browser_pdf", "browser_read",
+    "browser_tab", "browser_upload", "browser_wait",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory

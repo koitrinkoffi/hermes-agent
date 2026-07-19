@@ -274,9 +274,11 @@ class TestBrowserConsoleToolsetWiring:
         from toolsets import TOOLSETS
         assert "browser_console" in TOOLSETS["browser"]["tools"]
 
-    def test_in_hermes_core_tools(self):
+    def test_not_in_hermes_core_tools(self):
+        # Deliberately deferred (2026-07-19): browser_console is a low-level
+        # debug tool, not part of the everyday click/type/scroll surface.
         from toolsets import _HERMES_CORE_TOOLS
-        assert "browser_console" in _HERMES_CORE_TOOLS
+        assert "browser_console" not in _HERMES_CORE_TOOLS
 
     def test_in_legacy_toolset_map(self):
         from model_tools import _LEGACY_TOOLSET_MAP
