@@ -34,6 +34,11 @@ SOCK="$(mktemp -d /tmp/hermes-smoke-sock.XXXXXX)"
 PROFILE="$SITE/profile"
 export AGENT_BROWSER_SOCKET_DIR="$SOCK"
 session="smoke$$"
+# Derive the port from our own PID so concurrent/retried runs don't collide,
+# and pre-emptively clear it in case a prior failed run's http.server was
+# orphaned (its cleanup trap didn't get to run, e.g. `kill -9` on this script).
+PORT=$((20000 + $$ % 10000))
+fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
 
 cat > "$SITE/index.html" <<'HTML'
 <!DOCTYPE html><html><head><title>Smoke</title></head><body>
@@ -44,7 +49,11 @@ document.getElementById('result').textContent=e.target.files.length?('uploaded: 
 </body></html>
 HTML
 echo "smoke-$(date +%s)" > "$SITE/smoke_upload.txt"
-( cd "$SITE" && python3 -m http.server 8799 >/dev/null 2>&1 & echo $! > "$SITE/pid" )
+# No subshell/cd here: `cmd &` inside `( cd x && cmd & )` can make `$!` refer to
+# the wrapping subshell rather than cmd's own PID (bash-version-dependent), which
+# left orphaned http.server processes on kill. --directory sidesteps the cd.
+python3 -m http.server "$PORT" --directory "$SITE" >/dev/null 2>&1 &
+echo $! > "$SITE/pid"
 sleep 1
 
 cleanup() {
@@ -54,7 +63,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-open_result="$($AB --session "$session" --profile "$PROFILE" --json open http://localhost:8799/)"
+open_result="$($AB --session "$session" --profile "$PROFILE" --json open "http://localhost:${PORT}/")"
 echo "$open_result" | grep -q '"success":true' || { echo "✗ open failed: $open_result"; exit 1; }
 
 upload_result="$($AB --session "$session" --profile "$PROFILE" --json upload 'input[type=file]' "$SITE/smoke_upload.txt")"
