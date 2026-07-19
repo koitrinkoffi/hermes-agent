@@ -1938,7 +1938,20 @@ def cleanup_task_resources(agent, task_id: str) -> None:
         if agent.verbose_logging:
             logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
     try:
-        _ra().cleanup_browser(task_id)
+        # Mirror the persistent-env exemption above: a persistent local browser
+        # profile must survive between turns. Reaping it per-turn kills the
+        # agent-browser daemon (Helium zygote teardown) and drops in-memory page
+        # state, breaking multi-turn browser tasks (e.g. a 2FA login that pauses
+        # for user input and resumes next turn). The idle reaper
+        # (browser.inactivity_timeout) still tears it down once idle.
+        if _ra().is_persistent_browser_session(task_id):
+            if agent.verbose_logging:
+                logging.debug(
+                    f"Skipping per-turn cleanup_browser for persistent browser "
+                    f"session {task_id}; idle reaper will handle it."
+                )
+        else:
+            _ra().cleanup_browser(task_id)
     except Exception as e:
         if agent.verbose_logging:
             logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")

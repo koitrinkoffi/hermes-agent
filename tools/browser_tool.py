@@ -3364,6 +3364,17 @@ def browser_snapshot(
         }
         _copy_fallback_warning(response, result)
 
+        # Blank-active-tab steer: agent-browser auto-activates newly opened tabs,
+        # so a spurious about:blank / new-tab popup (login / 2FA flows) leaves the
+        # snapshot empty and strands the agent. When another tab still holds real
+        # content, surface it so the model switches back with browser_tab. Additive
+        # only — runs solely on an empty snapshot, never forces a switch. (2026-07-19)
+        _snap_txt = (response.get("snapshot") or "").strip()
+        if response.get("element_count", 0) == 0 and _snap_txt in ("", "(empty page)"):
+            _hint = _blank_tab_recovery_hint(effective_task_id)
+            if _hint is not None:
+                response["tab_recovery"] = _hint
+
         # Merge supervisor state (pending dialogs + frame tree) when a CDP
         # supervisor is attached to this task. No-op otherwise. See
         # website/docs/developer-guide/browser-supervisor.md.
@@ -4493,6 +4504,64 @@ def _normalize_tab_payload(data: Any) -> tuple[list[dict[str, Any]], Optional[in
             active_index = None
 
     return tabs, active_index
+
+
+# URLs that render an empty accessibility tree — a tab sitting on one is "blank".
+def _looks_blank_url(url: str) -> bool:
+    u = (url or "").strip().lower().rstrip("/")
+    if not u:
+        return True
+    return (
+        u in ("about:blank", "about:newtab")
+        or u.startswith("chrome://new-tab-page")
+        or u.startswith("chrome://newtab")
+        or u.startswith("edge://newtab")
+    )
+
+
+def _blank_tab_recovery_hint(effective_task_id: str) -> Optional[dict]:
+    """Steer hint for the empty-snapshot failure mode.
+
+    agent-browser auto-activates the newest tab, so a spurious about:blank /
+    new-tab popup — common on login / 2FA flows — steals focus and leaves
+    ``browser_snapshot`` empty. When the active tab is blank but another tab
+    still holds real content, return a hint so the agent switches back with
+    ``browser_tab`` instead of flailing on the empty page. Best-effort and
+    purely additive: never forces a switch, returns None when not applicable
+    (e.g. the page is legitimately blank with no other content tab). See the
+    agent-browser migration notes (blank-tab fix, 2026-07-19)."""
+    try:
+        result = _run_browser_command(effective_task_id, "tab", ["list"], timeout=8)
+        if not result.get("success"):
+            return None
+        tabs, _active_index = _normalize_tab_payload(result.get("data", {}))
+        if len(tabs) < 2:
+            return None
+        active = next((t for t in tabs if t.get("active")), None)
+        if active is None or not _looks_blank_url(active.get("url", "")):
+            return None
+        content = [
+            t for t in tabs
+            if not t.get("active") and not _looks_blank_url(t.get("url", ""))
+        ]
+        if not content:
+            return None
+        return {
+            "reason": "active_tab_blank",
+            "message": (
+                "The active tab is blank — a new/popup tab stole focus. "
+                f"{len(content)} other tab(s) hold real content. Call "
+                "browser_tab(action='switch', index=N) to return to the page, "
+                "then re-snapshot."
+            ),
+            "other_tabs": [
+                {"index": t["index"], "title": t.get("title", ""), "url": t.get("url", "")}
+                for t in content
+            ],
+        }
+    except Exception as exc:  # never let the steer break a snapshot
+        logger.debug("blank-tab recovery hint failed: %s", exc)
+        return None
 
 
 def _camofox_tab_list(task_id: Optional[str]) -> tuple[list[dict[str, Any]], Optional[int], dict[str, Any]]:
@@ -5666,6 +5735,38 @@ def _cleanup_old_recordings(max_age_hours=72):
 # ============================================================================
 # Cleanup and Management Functions
 # ============================================================================
+
+def is_persistent_browser_session(task_id: Optional[str] = None) -> bool:
+    """True when the task's live browser session uses the persistent local
+    profile (``features.persistent_profile``).
+
+    The per-turn finalizer (``cleanup_task_resources``) must NOT reap such a
+    session: killing the agent-browser daemon between turns tears down Helium
+    (zygote "Connection reset by peer" crash) and drops in-memory page state,
+    which breaks any MULTI-TURN browser task — e.g. a login that shows a 2FA
+    checkpoint, ends the turn to ask the user for the code, and resumes on the
+    next turn (the page is gone → re-login loop). The idle reaper
+    (``browser.inactivity_timeout``) and gateway shutdown still reap it, so
+    memory is freed once truly idle. Mirrors the ``is_persistent_env``
+    exemption already applied to the VM/terminal side in
+    ``cleanup_task_resources``.
+
+    Checks exactly the session keys ``cleanup_browser(task_id)`` would reap
+    (the task key, its ``::local`` sidecar, and the recorded last-active key),
+    so the exemption is precise — cloud/ephemeral sessions are never spared.
+    """
+    tid = task_id or "default"
+    candidate_keys = [tid, f"{tid}{_LOCAL_SUFFIX}"]
+    recorded = _last_active_session_key.get(tid)
+    if recorded and recorded not in candidate_keys:
+        candidate_keys.append(recorded)
+    with _cleanup_lock:
+        for key in candidate_keys:
+            info = _active_sessions.get(key)
+            if info and info.get("features", {}).get("persistent_profile"):
+                return True
+    return False
+
 
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """

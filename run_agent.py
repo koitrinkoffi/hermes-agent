@@ -141,7 +141,7 @@ from model_tools import (
 )
 from tools.terminal_tool import cleanup_vm
 from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
+from tools.browser_tool import cleanup_browser, is_persistent_browser_session
 
 
 # Agent internals extracted to agent/ package for modularity
