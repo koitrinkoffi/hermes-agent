@@ -799,7 +799,22 @@ def acquire_gateway_runtime_lock() -> bool:
 
     path = _get_gateway_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a+", encoding="utf-8")
+    try:
+        handle = open(path, "a+", encoding="utf-8")
+    except PermissionError:
+        # Stale root-owned lock file from a previous launchd Background
+        # session that ran as root (same failure mode handled in
+        # is_gateway_runtime_lock_active).  The parent directory owner can
+        # unlink files even when they don't own them, so remove the stale
+        # lock and retry once with a fresh file.
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        try:
+            handle = open(path, "a+", encoding="utf-8")
+        except OSError:
+            return False
     if not _try_acquire_file_lock(handle):
         handle.close()
         return False
@@ -834,7 +849,18 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     if not resolved_lock_path.exists():
         return False
 
-    handle = open(resolved_lock_path, "a+", encoding="utf-8")
+    try:
+        handle = open(resolved_lock_path, "a+", encoding="utf-8")
+    except PermissionError:
+        # Stale root-owned lock file from a previous launchd Background
+        # session that ran as root.  The parent directory owner can unlink
+        # files even when they don't own them, so remove the stale lock
+        # and report inactive — the new process will create a fresh one.
+        try:
+            resolved_lock_path.unlink()
+        except OSError:
+            pass
+        return False
     try:
         if _try_acquire_file_lock(handle):
             _release_file_lock(handle)
@@ -933,6 +959,52 @@ def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]
     the active profile's ``gateway_state.json``.
     """
     return _read_json_file(path or _get_runtime_status_path())
+
+
+# Max age of a persisted ``gateway_state.json`` snapshot before its liveness
+# claim is treated as suspect.  A healthy gateway rewrites the file (advancing
+# ``updated_at``) far more often than this; a record older than the TTL whose
+# PID is also dead almost certainly outlived an ungracefully-killed writer
+# (taskkill /F, OOM, power loss) that never ran its shutdown handler.
+_RUNTIME_STATUS_STALE_TTL_S = 120
+
+
+def runtime_status_is_stale(
+    record: Optional[dict[str, Any]],
+    ttl_s: int = _RUNTIME_STATUS_STALE_TTL_S,
+) -> bool:
+    """Return True when the runtime-status snapshot is older than ``ttl_s``.
+
+    Delegates to the existing :func:`_marker_is_stale` on the record's
+    ``updated_at`` timestamp.  A missing or unparseable timestamp is treated as
+    stale (the freshness signal is absent, so it cannot vouch for the record).
+    """
+    if not isinstance(record, dict):
+        return True
+    return _marker_is_stale(record.get("updated_at") or "", ttl_s)
+
+
+def runtime_status_pid_is_live(record: Optional[dict[str, Any]]) -> bool:
+    """Return True when the PID recorded in the snapshot is still alive.
+
+    Uses the existing no-kill :func:`_pid_exists` probe and the same
+    ``start_time`` PID-reuse guard as :func:`get_runtime_status_running_pid`:
+    when both the recorded and live start-times are known they must match, so a
+    recycled PID (same number, different process) is not mistaken for the
+    original.  Degrades to ``False`` when the record has no usable PID.
+    """
+    pid = _pid_from_record(record)
+    if pid is None or not _pid_exists(pid):
+        return False
+    recorded_start = (record or {}).get("start_time")
+    current_start = _get_process_start_time(pid)
+    if (
+        recorded_start is not None
+        and current_start is not None
+        and current_start != recorded_start
+    ):
+        return False
+    return True
 
 
 def parse_active_agents(raw: Any) -> int:
@@ -1110,17 +1182,18 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                     and current_start != existing.get("start_time")
                 ):
                     stale = True
-                # When start_time comparison is unavailable (macOS / Windows
-                # have no /proc, so both sides are None), fall back to
-                # checking the live process command line.  When cmdline is
-                # also unreadable (Windows has no ps), consult the lock
-                # record's own argv — the gateway writes it at startup and
-                # it's the only identity signal on platforms without ps.
-                # Both oracles must indicate "not a gateway" to mark stale.
+                # When start_time comparison is unavailable on either side
+                # (macOS / Windows have no /proc, so the lock record's
+                # start_time may be None; psutil may also fail to read
+                # create_time for recycled PIDs), fall back to checking the
+                # live process command line.  When cmdline is also unreadable
+                # (Windows has no ps), consult the lock record's own argv —
+                # the gateway writes it at startup and it's the only identity
+                # signal on platforms without ps.  Both oracles must indicate
+                # "not a gateway" to mark stale.
                 if (
                     not stale
-                    and existing.get("start_time") is None
-                    and current_start is None
+                    and (existing.get("start_time") is None or current_start is None)
                     and not _looks_like_gateway_process(existing_pid)
                 ):
                     live_cmdline = _read_process_cmdline(existing_pid)
@@ -1157,10 +1230,27 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                     except (OSError, PermissionError):
                         pass
         if stale:
+            # Remove the stale lock ATOMICALLY by renaming it to a tombstone
+            # instead of unlinking. With unlink()+O_EXCL, two racing starters
+            # could both observe "removed" (the second unlink() silently
+            # deleting the first racer's freshly-created lock) and both win.
+            # os.replace() is atomic: exactly one racer claims the stale
+            # file; the loser gets FileNotFoundError and falls through to
+            # the O_EXCL create below, where at most one process succeeds.
+            tombstone = lock_path.with_name(lock_path.name + ".stale")
             try:
-                lock_path.unlink(missing_ok=True)
+                os.replace(lock_path, tombstone)
+            except FileNotFoundError:
+                # Another racer already claimed the stale lock (and may have
+                # created a fresh one) — let O_EXCL below decide the winner.
+                pass
             except OSError:
                 pass
+            else:
+                try:
+                    tombstone.unlink(missing_ok=True)
+                except OSError:
+                    pass
         else:
             return False, existing
 
