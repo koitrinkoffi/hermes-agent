@@ -1,7 +1,7 @@
 ---
 name: hermes-stack-upgrade
 description: Safely upgrade the Hermes agent while preserving local mods (fork workflow), with conflict-aware merges, an end-to-end smoke gate, and one-command rollback.
-version: 2.0.0
+version: 2.1.0
 author: Koitrin KOFFI
 license: MIT
 platforms: [linux]
@@ -83,25 +83,31 @@ at any ✗ or exit code 2.
    cd "$HOME/.hermes/hermes-agent" && uv pip install -e ".[all]" --python venv/bin/python
    ```
 
-4. **Restart services** so the new code is live:
+4. **Hand off the rest to a detached finisher, then STOP.** Everything from here
+   — restart, smoke gate, deploy-or-rollback — is deterministic shell that does
+   **not** need you (the agent). Crucially, the restart in step 1 of the finisher
+   restarts `hermes-gateway`, **the unit you are running inside** (kanban is
+   dispatched in-gateway). That unit is `KillMode=mixed`, so on restart the whole
+   cgroup is SIGKILLed: if you ran these steps inline you would be killed at the
+   restart and the smoke gate + deploy/rollback would **never run** (the classic
+   "it restarted but did nothing after" bug). So launch them as their **own
+   transient unit**, which lives in a separate cgroup and survives the restart:
    ```bash
-   bash ${HERMES_SKILL_DIR}/scripts/restart_services.sh
+   systemd-run --user --collect --unit="hermes-upgrade-finish-$(date +%s)" \
+     bash ${HERMES_SKILL_DIR}/scripts/finish_upgrade.sh
    ```
+   `finish_upgrade.sh` then runs on its own: restart services → wait until
+   `hermes-gateway` is active → **smoke gate** → **green**: `push_backups.sh` +
+   `deploy_self.sh` / **red**: `rollback.sh` (fork untouched) → **Telegram ping**
+   (`hermes send`) with the verdict. It first self-copies to `/tmp` so
+   `deploy_self.sh` replacing the live skill dir can't pull the rug from under it.
 
-5. **Smoke gate** — must be green to proceed:
-   ```bash
-   bash ${HERMES_SKILL_DIR}/scripts/smoke.sh
-   ```
-
-6. **On green → back up + redeploy this skill:**
-   ```bash
-   bash ${HERMES_SKILL_DIR}/scripts/push_backups.sh
-   bash ${HERMES_SKILL_DIR}/scripts/deploy_self.sh
-   ```
-   **On red → roll back** (fork untouched), then investigate:
-   ```bash
-   bash ${HERMES_SKILL_DIR}/scripts/rollback.sh
-   ```
+   **After launching it, you are done.** Tell the user the upgrade is finishing in
+   the background and they'll get a Telegram ping with the result (🟢 deployed /
+   🔴 rolled back). **Do NOT** run `restart_services.sh` yourself, **do NOT** wait
+   on the finisher — you'd be killed and nothing after would run. The verdict also
+   lands in `~/.hermes/state/stack-upgrade-last-result.txt` (full log:
+   `stack-upgrade-finish.log`).
 
 ## One-Time Setup (already done on this machine; documented for a fresh rebuild)
 
@@ -153,6 +159,11 @@ at any ✗ or exit code 2.
 
 ## Verification
 
+- The finisher (step 4) runs async and reports the verdict on **Telegram**; it is
+  also written to `~/.hermes/state/stack-upgrade-last-result.txt`, with the full
+  transcript in `~/.hermes/state/stack-upgrade-finish.log`. Check it is still
+  running with `systemctl --user list-units 'hermes-upgrade-finish-*'` (it
+  self-removes on completion via `--collect`).
 - `smoke.sh` exits 0 (both layers pass).
 - `git -C ~/.hermes/hermes-agent log --oneline -1` shows your mod commit reachable
   from `hermes-mods`.
