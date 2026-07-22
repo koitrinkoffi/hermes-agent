@@ -2212,7 +2212,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_eval",
-        "description": "Execute a JavaScript expression in the current page and return its result. Powerful escape hatch: extract structured data in one call, scroll inner containers, trigger events the accessibility tree can't reach. Use sparingly, prefer dedicated browser tools when they suffice.",
+        "description": "Execute a JavaScript expression in the current page and return its result. Use this to READ structured data from the DOM in one cheap call (e.g. pull a listing's fields out of window.__NEXT_DATA__ or JSON-LD, count/collect elements, scroll an inner container). Do NOT use it to INTERACT: for clicking, typing, scrolling the page, or navigating, always prefer browser_click / browser_type / browser_scroll / browser_navigate — they are more reliable than synthetic JS events and keep the accessibility tree in sync. Rule of thumb: reading the page → eval is great; changing the page → use the dedicated tool.",
         "parameters": {
             "type": "object",
             "properties": {

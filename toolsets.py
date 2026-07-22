@@ -46,15 +46,23 @@ _HERMES_CORE_TOOLS = [
     # Browser automation — the everyday-driving tools are pinned core so none
     # of THEM is deferred behind tool_search (a deferred wheel/tab/upload tool
     # it can't find falls back to a weaker one, e.g. page-level scroll on a
-    # virtualised feed). browser_eval/browser_cdp/browser_console are
-    # deliberately left OUT (2026-07-19): once pinned, Hermes reached for raw
-    # JS (browser_eval) even where browser_click/type/scroll would do — the
-    # tool_search friction now nudges it back to the simple tools first,
-    # while eval/cdp/console stay reachable for the cases that really need them.
+    # virtualised feed).
+    #
+    # browser_eval was left OUT on 2026-07-19 (Hermes reached for raw JS even
+    # where click/type/scroll would do). RE-PINNED 2026-07-22: on the Telegram
+    # platform the large plugin surface pushes the deferrable set past the
+    # tool_search threshold, so browser_eval got deferred and the model — unable
+    # to reach it without a tool_search round-trip — fell back to click/snapshot
+    # and drifted (stale-ref loops), breaking skills whose whole strategy is one
+    # cheap DOM read (screen-leboncoin-favorites: enumerate + extract via
+    # __NEXT_DATA__). The 2026-07-19 over-reach concern is instead handled by
+    # steering in browser_eval's own tool description ("prefer click/type/scroll
+    # for interaction; use eval only to READ structured data"). browser_cdp /
+    # browser_console stay OUT — they're genuinely rarely needed.
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_drag", "browser_back",
     "browser_press", "browser_get_images",
-    "browser_vision", "browser_dialog",
+    "browser_vision", "browser_dialog", "browser_eval",
     "browser_download", "browser_dropzone_upload",
     "browser_mouse", "browser_mouse_wheel", "browser_pdf",
     "browser_tab", "browser_upload",
