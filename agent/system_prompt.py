@@ -292,7 +292,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-    if has_skills_tools:
+    if has_skills_tools and getattr(agent, "platform", None) == "subagent":
+        # Delegated children get a lean skills POINTER instead of the full
+        # <available_skills> index. A subagent works one focused task with a
+        # small context (and, on this install, a small local model), so pushing
+        # the entire skill tree into every child prompt is pure overhead — the
+        # same index is available on demand via skills_list, and skill_view
+        # loads any single skill. Neither is in DELEGATE_BLOCKED_TOOLS, so a
+        # child can always reach them. Main-agent path (below) is unchanged.
+        # Rollback: git tag mods-checkpoint-2026.07.22-pre-lean-subagent-prompt
+        skills_prompt = (
+            "## Skills (available on demand)\n"
+            "Reusable skills exist for common tasks. If your assigned task might "
+            "match one, call `skills_list` to see the index, then "
+            "`skill_view(name)` to load it before acting. Don't guess a skill's "
+            "contents — load it."
+        )
+    elif has_skills_tools:
         avail_toolsets = {
             toolset
             for toolset in (
