@@ -8,6 +8,7 @@ import {
   kanbanWorktreeDir,
   liveSessionProjectId,
   mergeRepoWorktreeGroups,
+  NO_PROJECT_ID,
   overlayLiveLanes,
   overlayLivePreviews,
   sessionProjectColor,
@@ -458,6 +459,25 @@ const projectNode = (over: Partial<SidebarProjectTree> & Pick<SidebarProjectTree
   ...over
 })
 
+// Home as the backend emits it: no path, one synthetic lane carrying the rows.
+const homeNode = (sessions: SessionInfo[]): SidebarProjectTree =>
+  projectNode({
+    id: NO_PROJECT_ID,
+    isNoProject: true,
+    label: 'Home',
+    path: null,
+    repos: [
+      {
+        id: NO_PROJECT_ID,
+        label: 'Home',
+        path: null,
+        sessionCount: sessions.length,
+        groups: [lane({ id: NO_PROJECT_ID, label: 'Home', sessions })]
+      }
+    ],
+    sessionCount: sessions.length
+  })
+
 describe('liveSessionProjectId', () => {
   it('maps a brand-new (unpersisted) session to its auto project (the repo root)', () => {
     expect(liveSessionProjectId(makeSession('/www/app'), [])).toBe('/www/app')
@@ -503,6 +523,24 @@ describe('liveSessionProjectId', () => {
     ])
 
     expect(id).toBe('p_app')
+  })
+
+  it('places a cwd-outside-root session under an explicit project matching either path', () => {
+    // A mid-session relocation (or a sibling worktree) leaves cwd outside the
+    // recorded repo root. An explicit folder match is still authoritative —
+    // only the auto-project (repo root) fallback needs cwd-under-root
+    // confidence. Match via the repo root...
+    expect(
+      liveSessionProjectId(makeSession('/www/elsewhere', { git_repo_root: '/home/u/proj' }), [
+        makeProject('p_proj', ['/home/u/proj'])
+      ])
+    ).toBe('p_proj')
+    // ...and via the cwd.
+    expect(
+      liveSessionProjectId(makeSession('/www/elsewhere/sub', { git_repo_root: '/home/u/proj' }), [
+        makeProject('p_www', ['/www/elsewhere'])
+      ])
+    ).toBe('p_www')
   })
 
   it('matches a mixed-case/separator Windows cwd to its explicit project in the live overlay', () => {
@@ -551,6 +589,14 @@ describe('sessionProjectColor', () => {
     const session = makeSession(null, { git_repo_root: '/www/app' })
 
     expect(sessionProjectColor(session, [colored('p_app', ['/www/app'], '#4a9eff')])).toBe('#4a9eff')
+  })
+
+  it('colors a cwd-outside-root session when an explicit project folder matches', () => {
+    // The backend tree groups such a row under the project; the client color
+    // derivation must agree instead of leaving the row (and its tab) grey.
+    const session = makeSession('/www/elsewhere', { git_repo_root: '/home/u/proj' })
+
+    expect(sessionProjectColor(session, [colored('p_proj', ['/home/u/proj'], '#4a9eff')])).toBe('#4a9eff')
   })
 
   it('returns null for a session that only maps to an auto repo root (no explicit project)', () => {
@@ -763,6 +809,26 @@ describe('overlayLiveLanes', () => {
     expect(overlaid.repos[0].groups[0].sessions.map(s => s.id)).toEqual(['keep'])
     expect(overlaid.sessionCount).toBe(1)
   })
+
+  it('adds a brand-new detached chat to Home, and evicts a deleted one', () => {
+    const existing = makeSession(null, { id: 'old', started_at: 1 })
+    const doomed = makeSession(null, { id: 'gone', started_at: 2 })
+    const home = homeNode([existing, doomed])
+
+    const overlaid = overlayLiveLanes(home, [makeSession(null, { id: 'fresh', started_at: 9 })], new Set(['gone']))
+
+    expect(overlaid.repos[0].groups[0].sessions.map(s => s.id)).toEqual(['fresh', 'old'])
+    expect(overlaid.sessionCount).toBe(2)
+  })
+
+  it('leaves Home alone for a session that has a cwd', () => {
+    // A cwd-carrying row the backend hasn't placed yet (junk root, deleted
+    // workspace) needs its probes — guessing here would flicker it into Home
+    // and back out on the next snapshot.
+    const home = homeNode([])
+
+    expect(overlayLiveLanes(home, [makeSession('/www/app', { id: 'fresh' })])).toBe(home)
+  })
 })
 
 describe('overlayLivePreviews', () => {
@@ -791,5 +857,11 @@ describe('overlayLivePreviews', () => {
     const previews = overlayLivePreviews([project], [], [], 3, new Set(['gone']))
 
     expect(previews['/www/app'].map(s => s.id)).toEqual(['old'])
+  })
+
+  it('previews a detached session under Home, which no cwd could place', () => {
+    const previews = overlayLivePreviews([homeNode([])], [makeSession(null, { id: 'fresh' })], [], 3)
+
+    expect(previews[NO_PROJECT_ID].map(s => s.id)).toEqual(['fresh'])
   })
 })
