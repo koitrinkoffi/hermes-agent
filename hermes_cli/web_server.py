@@ -448,7 +448,9 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
-def _is_accepted_host(host_header: str, bound_host: str) -> bool:
+def _is_accepted_host(
+    host_header: str, bound_host: str, extra_allowed: frozenset = frozenset()
+) -> bool:
     """True if the Host header targets the interface we bound to.
 
     Accepts:
@@ -456,6 +458,9 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     - Loopback aliases when bound to loopback
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
+    - Any host in ``extra_allowed`` (operator-configured
+      ``dashboard.extra_allowed_hosts``, e.g. a `tailscale serve` name)
+      when bound to loopback
     """
     if not host_header:
         return False
@@ -486,7 +491,7 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+        return host_only in _LOOPBACK_HOST_VALUES or host_only in extra_allowed
 
     # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc
@@ -509,7 +514,8 @@ async def host_header_middleware(request: Request, call_next):
     bound_host = getattr(app.state, "bound_host", None)
     if bound_host:
         host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
+        extra_allowed = getattr(app.state, "extra_allowed_hosts", frozenset())
+        if not _is_accepted_host(host_header, bound_host, extra_allowed):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -17346,8 +17352,10 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not bound_host:
         return None
 
+    extra_allowed = getattr(app.state, "extra_allowed_hosts", frozenset())
+
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(host_header, bound_host):
+    if not _is_accepted_host(host_header, bound_host, extra_allowed):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
 
     origin = ws.headers.get("origin", "")
@@ -17364,7 +17372,7 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _is_accepted_host(parsed.netloc, bound_host, extra_allowed):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -20176,6 +20184,12 @@ def start_server(
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
     app.state.bound_host = host
+    _extra_hosts_cfg = (load_config().get("dashboard") or {}).get(
+        "extra_allowed_hosts"
+    ) or []
+    app.state.extra_allowed_hosts = frozenset(
+        h.strip().lower() for h in _extra_hosts_cfg if h and h.strip()
+    )
 
     # ── Start uvicorn with direct Server API ─────────────────────────
     # We use uvicorn.Server directly (not uvicorn.run) so we can split

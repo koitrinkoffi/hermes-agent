@@ -2224,6 +2224,16 @@ DEFAULT_CONFIG = {
         # falls through to request reconstruction rather than breaking
         # the login flow.
         "public_url": "",
+        # Extra Host-header values accepted by host_header_middleware
+        # (web_server.py) on top of the loopback aliases, when bound to
+        # 127.0.0.1. For reaching the dashboard through a trusted external
+        # name that terminates on this same loopback port — e.g. a
+        # `tailscale serve` proxy — without weakening the anti-DNS-rebinding
+        # check (GHSA-ppp5-vxwm-4cf7) to accept arbitrary hosts. Only exact,
+        # operator-listed hostnames are accepted; each entry should be a
+        # name you control end-to-end (a tailnet MagicDNS name, not a
+        # third-party domain).
+        "extra_allowed_hosts": [],
     },
 
     # Privacy settings
