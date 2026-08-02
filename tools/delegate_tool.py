@@ -23,6 +23,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+import re
 import threading
 import time
 from concurrent.futures import (
@@ -2762,18 +2763,24 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    model: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
       - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Batch:  provide tasks array [{goal, context, role, model}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'model' parameter overrides the model for this call only, as a bare
+    model id or "provider:model".  It beats delegation.model from config;
+    per-task model beats the top-level one.  Unset means the configured
+    delegation model, else the parent's.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2879,6 +2886,26 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    # Per-call model override: per-task 'model' beats the top-level one, which
+    # beats delegation.model from config (already folded into `creds`). Each
+    # distinct override string is resolved once — validating a batch that all
+    # picks the same model costs a single catalog lookup.
+    override_cache: Dict[str, dict] = {}
+    task_creds: List[dict] = []
+    for task in task_list:
+        raw_model = _clean_model_str(task.get("model") or model)
+        if not raw_model:
+            task_creds.append(creds)
+            continue
+        if raw_model not in override_cache:
+            resolved, override_error = _resolve_model_override(
+                raw_model, cfg, creds, parent_agent
+            )
+            if override_error:
+                return tool_error(override_error)
+            override_cache[raw_model] = resolved
+        task_creds.append(override_cache[raw_model])
+
     overall_start = time.monotonic()
     results = []
 
@@ -2923,6 +2950,8 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        # Per-task credentials: `creds` unless this task overrode the model.
+        t_creds = task_creds[i]
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -2930,18 +2959,18 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
-            model=creds["model"],
+            model=t_creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
+            override_provider=t_creds["provider"],
+            override_base_url=t_creds["base_url"],
+            override_api_key=t_creds["api_key"],
+            override_api_mode=t_creds["api_mode"],
+            override_request_overrides=t_creds.get("request_overrides"),
+            override_max_tokens=t_creds.get("max_output_tokens"),
+            override_acp_command=t_creds.get("command"),
+            override_acp_args=t_creds.get("args"),
             role=effective_role,
         )
         # Tee the child's progress events into its live transcript log.
@@ -3298,7 +3327,9 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            # Display label only. With per-task overrides the batch may span
+            # several models; show them all rather than a misleading single id.
+            model=_batch_model_label(task_creds, creds),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3450,6 +3481,316 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Per-call model override
+# ---------------------------------------------------------------------------
+#
+# delegation.model / delegation.provider pin EVERY subagent to one model. The
+# `model` parameter (top-level and per-task) narrows that to a single call, so
+# a cheap task can run on a small local model while a review runs on the big
+# one. Accepted forms:
+#
+#   "Qwen3.5-4B-MTP"            -> same endpoint as the children would use
+#                                  anyway (delegation config, else inherited
+#                                  from the parent), only the model id changes
+#   "ollama-cloud:gemma4:31b"   -> full credential resolution for that
+#                                  provider via resolve_runtime_provider()
+#
+# The provider prefix is matched longest-first against known provider slugs, so
+# colon-bearing model ids ("gemma4:31b") and two-segment custom slugs
+# ("custom:lemonade:Qwen3.5-4B") both parse correctly.
+
+_MODEL_CATALOG_TTL = 300.0  # seconds; /models rarely changes mid-session
+_model_catalog_cache: Dict[str, tuple] = {}
+_model_catalog_lock = threading.Lock()
+
+# A local endpoint's catalog mixes chat models with embedding / rerank / ASR /
+# OCR ones. Those are filtered out of what the schema ADVERTISES (suggesting
+# them as subagent models is noise), but never out of validation — an explicit,
+# deliberate choice of a served model is honoured.
+_NON_CHAT_MODEL_RE = re.compile(
+    r"(?i)(embed|rerank|asr|whisper|\bocr\b|-tts|-stt|"
+    r"stable-diffusion|flux|sdxl|image-gen)"
+)
+
+
+def _clean_model_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _custom_provider_entries() -> List[dict]:
+    """All configured custom-provider blocks (legacy list + providers dict)."""
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+
+        return list(get_compatible_custom_providers(load_config()) or [])
+    except Exception as exc:
+        logger.debug("Could not load custom providers: %s", exc)
+        return []
+
+
+def _known_provider_slugs() -> set:
+    """Lowercased provider names a `provider:model` prefix may name.
+
+    Unions every table a user could plausibly type from: the auth registry,
+    the canonical provider list, both alias tables, and the custom providers
+    from config.yaml. A slug missing here silently degrades "provider:model"
+    into a bare (and then unrecognised) model id, so breadth matters more than
+    precision — resolve_runtime_provider still rejects anything unusable.
+    """
+    slugs = set()
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        slugs.update(str(k).strip().lower() for k in PROVIDER_REGISTRY)
+    except Exception as exc:
+        logger.debug("Could not read PROVIDER_REGISTRY: %s", exc)
+    try:
+        from hermes_cli.models import _PROVIDER_ALIASES, _PROVIDER_LABELS
+
+        slugs.update(str(k).strip().lower() for k in _PROVIDER_LABELS)
+        slugs.update(str(k).strip().lower() for k in _PROVIDER_ALIASES)
+    except Exception as exc:
+        logger.debug("Could not read canonical provider tables: %s", exc)
+    try:
+        from hermes_cli.providers import ALIASES
+
+        slugs.update(str(k).strip().lower() for k in ALIASES)
+    except Exception as exc:
+        logger.debug("Could not read provider aliases: %s", exc)
+    for entry in _custom_provider_entries():
+        name = str(entry.get("name") or "").strip().lower()
+        if name:
+            slugs.add(name)
+            slugs.add(f"custom:{name}")
+    slugs.discard("")
+    return slugs
+
+
+def _split_provider_model(raw: str) -> tuple:
+    """Split "provider:model" into (provider|None, model).
+
+    Longest provider prefix wins, so "custom:lemonade:Qwen3.5-4B" resolves to
+    the custom:lemonade provider rather than the generic "custom" one, and a
+    bare "gemma4:31b" (no matching prefix) stays a model id.
+    """
+    raw = _clean_model_str(raw)
+    if ":" not in raw:
+        return None, raw
+    known = _known_provider_slugs()
+    parts = raw.split(":")
+    for i in range(len(parts) - 1, 0, -1):
+        prefix = ":".join(parts[:i])
+        if prefix.strip().lower() in known:
+            return prefix, ":".join(parts[i:]).strip()
+    return None, raw
+
+
+def _declared_models_for_provider(provider: Optional[str]) -> List[str]:
+    """Model ids declared in config.yaml for a custom provider (no network)."""
+    name = _clean_model_str(provider).lower()
+    if name.startswith("custom:"):
+        name = name.split(":", 1)[1]
+    if not name:
+        return []
+    try:
+        from hermes_cli.model_switch import _declared_model_ids
+    except Exception:
+        return []
+    for entry in _custom_provider_entries():
+        if str(entry.get("name") or "").strip().lower() != name:
+            continue
+        try:
+            return list(_declared_model_ids(entry.get("models")) or [])
+        except Exception:
+            return []
+    return []
+
+
+def _endpoint_model_ids(
+    base_url: Optional[str],
+    api_key: Optional[str],
+    api_mode: Optional[str],
+    *,
+    allow_fetch: bool = True,
+) -> List[str]:
+    """Model ids served by an OpenAI-compatible endpoint, TTL-cached.
+
+    ``allow_fetch=False`` returns only an already-cached answer — used on the
+    schema-building path, which runs on every get_definitions() call and must
+    never block on HTTP.
+    """
+    key = _clean_model_str(base_url).rstrip("/")
+    if not key:
+        return []
+    now = time.time()
+    with _model_catalog_lock:
+        entry = _model_catalog_cache.get(key)
+        if entry and (now - entry[0]) < _MODEL_CATALOG_TTL:
+            return list(entry[1])
+    if not allow_fetch:
+        return []
+    try:
+        from hermes_cli.models import probe_api_models
+
+        probed = probe_api_models(api_key, key, timeout=5.0, api_mode=api_mode)
+        ids = [str(m) for m in (probed.get("models") or []) if m]
+    except Exception as exc:
+        logger.debug("Model catalog probe failed for %s: %s", key, exc)
+        ids = []
+    if ids:
+        with _model_catalog_lock:
+            _model_catalog_cache[key] = (now, list(ids))
+    return ids
+
+
+def _known_model_ids_for(
+    provider: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    api_mode: Optional[str],
+    *,
+    allow_fetch: bool = True,
+) -> List[str]:
+    """Union of config-declared and live-advertised model ids, deduped."""
+    seen: set = set()
+    out: List[str] = []
+    for candidate in (
+        _declared_models_for_provider(provider)
+        + _endpoint_model_ids(base_url, api_key, api_mode, allow_fetch=allow_fetch)
+    ):
+        lowered = candidate.strip().lower()
+        if lowered and lowered not in seen:
+            seen.add(lowered)
+            out.append(candidate.strip())
+    return out
+
+
+def _parent_api_key(parent_agent) -> Optional[str]:
+    key = getattr(parent_agent, "api_key", None)
+    if (not key) and hasattr(parent_agent, "_client_kwargs"):
+        key = (parent_agent._client_kwargs or {}).get("api_key")
+    return key
+
+
+def _configured_runtime_provider() -> Optional[str]:
+    """The provider slug the parent agent is configured with (e.g. custom:x).
+
+    ``parent_agent.provider`` is the *resolved* family ("custom"), which is too
+    coarse to look up config-declared models; the config keeps the specific
+    slug.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        model_cfg = (load_config() or {}).get("model")
+        if isinstance(model_cfg, dict):
+            return _clean_model_str(model_cfg.get("provider")) or None
+    except Exception as exc:
+        logger.debug("Could not read configured provider: %s", exc)
+    return None
+
+
+def _resolve_model_override(
+    raw: str, cfg: dict, base_creds: dict, parent_agent
+) -> tuple:
+    """Resolve a per-call model override into a credential bundle.
+
+    Returns ``(creds, None)`` on success or ``(None, error_message)``. The
+    returned bundle has the same shape as ``_resolve_delegation_credentials``
+    so it drops straight into ``_build_child_agent``'s override_* kwargs.
+
+    A model id that no reachable catalog knows about is rejected here rather
+    than 60 seconds later inside the child's first API call. When no catalog
+    can be read (endpoint down, provider without a /models route), the override
+    is accepted as-is — discovery failure must not disable the feature.
+    """
+    provider, model = _split_provider_model(raw)
+    if not model:
+        return None, (
+            f"Invalid model override {raw!r}: expected 'model' or "
+            f"'provider:model'."
+        )
+
+    if provider:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(requested=provider, target_model=model)
+        except Exception as exc:
+            return None, (
+                f"Cannot resolve provider {provider!r} for model override "
+                f"{raw!r}: {exc}. Drop the provider prefix to keep the "
+                f"subagent on the current endpoint."
+            )
+        api_key = runtime.get("api_key", "")
+        if not api_key:
+            return None, (
+                f"Provider {provider!r} resolved but has no API key. Set its "
+                f"environment variable or run 'hermes auth'."
+            )
+        creds = {
+            "model": model,
+            "provider": (
+                provider
+                if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+                else runtime.get("provider")
+            ),
+            "base_url": runtime.get("base_url"),
+            "api_key": api_key,
+            "api_mode": runtime.get("api_mode"),
+            "request_overrides": dict(runtime.get("request_overrides") or {}),
+            "max_output_tokens": runtime.get("max_output_tokens"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+        }
+        catalog_provider = provider
+    else:
+        # Same endpoint the children would have used — swap only the model id.
+        creds = dict(base_creds)
+        creds["model"] = model
+        catalog_provider = (
+            _clean_model_str(cfg.get("provider")) or _configured_runtime_provider()
+        )
+
+    # Validate against the endpoint the child will actually hit.
+    eff_base = creds.get("base_url") or getattr(parent_agent, "base_url", None)
+    eff_key = creds.get("api_key") or _parent_api_key(parent_agent)
+    eff_mode = creds.get("api_mode") or getattr(parent_agent, "api_mode", None)
+    known = _known_model_ids_for(catalog_provider, eff_base, eff_key, eff_mode)
+    if known:
+        by_lower = {m.lower(): m for m in known}
+        canonical = by_lower.get(model.lower())
+        if canonical is None:
+            listed = ", ".join(known[:20])
+            more = f" (+{len(known) - 20} more)" if len(known) > 20 else ""
+            return None, (
+                f"Unknown subagent model {model!r} for "
+                f"{catalog_provider or 'the current provider'}. Available: "
+                f"{listed}{more}. Omit 'model' to inherit the parent's."
+            )
+        creds["model"] = canonical
+
+    return creds, None
+
+
+def _batch_model_label(task_creds: List[dict], base_creds: dict) -> Optional[str]:
+    """Model label for a batch's dispatch record (display metadata only).
+
+    One model → that id (unchanged from before per-task overrides existed);
+    several → all of them, so the completion record doesn't claim the whole
+    fan-out ran on one model.
+    """
+    models = []
+    for entry in task_creds or []:
+        name = _clean_model_str((entry or {}).get("model"))
+        if name and name not in models:
+            models.append(name)
+    if not models:
+        return base_creds.get("model")
+    return models[0] if len(models) == 1 else ", ".join(models)
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -3728,7 +4069,10 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        f"- Subagent model IS selectable per call via 'model' (top-level, or "
+        f"per task inside 'tasks'). {_model_param_hint()} Omit it and children "
+        f"inherit delegation.model from config.yaml, else the parent's model "
+        f"and its fallback chain.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3785,6 +4129,70 @@ def _build_role_param_description() -> str:
     )
 
 
+def _schema_model_candidates(limit: int = 24) -> List[str]:
+    """Model ids to advertise in the schema — cheap sources only.
+
+    This runs on every get_definitions() call, so it never touches the network:
+    config-declared models for the delegation/configured provider, plus any
+    catalog already cached by a previous override validation this session.
+    """
+    try:
+        cfg = _load_config()
+    except Exception:
+        cfg = {}
+    provider = _clean_model_str(cfg.get("provider")) or _configured_runtime_provider()
+    base_url = _clean_model_str(cfg.get("base_url")) or None
+    ids = [
+        m
+        for m in _known_model_ids_for(provider, base_url, None, None, allow_fetch=False)
+        if not _NON_CHAT_MODEL_RE.search(m)
+    ]
+    if not ids:
+        with _model_catalog_lock:
+            cached = [
+                m for entry in _model_catalog_cache.values() for m in entry[1]
+            ]
+        seen: set = set()
+        for name in cached:
+            lowered = name.lower()
+            if lowered not in seen and not _NON_CHAT_MODEL_RE.search(name):
+                seen.add(lowered)
+                ids.append(name)
+    return ids[:limit]
+
+
+def _model_param_hint() -> str:
+    """One-sentence hint naming the models this install can actually serve."""
+    candidates = _schema_model_candidates()
+    if not candidates:
+        return (
+            "Give a model id, or 'provider:model' (e.g. "
+            "'ollama-cloud:gemma4:31b') to route the child to another "
+            "configured provider."
+        )
+    return (
+        "Available here: " + ", ".join(candidates) + ". Prefix with a provider "
+        "('ollama-cloud:gemma4:31b') to route the child to a different "
+        "configured provider."
+    )
+
+
+def _build_model_param_description(*, per_task: bool) -> str:
+    """Compose the 'model' parameter description with the live model list."""
+    scope = (
+        "Model for THIS task, beating the top-level 'model'."
+        if per_task
+        else "Model for the subagent(s) spawned by this call only."
+    )
+    return (
+        f"{scope} {_model_param_hint()} An unknown id is rejected up front "
+        "with the list of valid ones. Omit to inherit the configured "
+        "delegation model, else the parent's. Use it to match cost to the "
+        "work: a small fast model for mechanical extraction, a large one for "
+        "reasoning-heavy review."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -3801,6 +4209,19 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    overrides_params["properties"]["model"]["description"] = _build_model_param_description(
+        per_task=False
+    )
+    # tasks.items (and its properties) are shared with the static schema until
+    # copied — deep-copy the two levels we rewrite.
+    tasks_items = dict(overrides_params["properties"]["tasks"]["items"])
+    tasks_items["properties"] = {
+        k: dict(v) for k, v in tasks_items["properties"].items()
+    }
+    tasks_items["properties"]["model"]["description"] = _build_model_param_description(
+        per_task=True
+    )
+    overrides_params["properties"]["tasks"]["items"] = tasks_items
 
     return {
         "description": _build_top_level_description(),
@@ -3857,6 +4278,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "(rebuilt at get_definitions() time)",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3868,6 +4293,10 @@ DELEGATE_TASK_SCHEMA = {
             "role": {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
+                "description": "(rebuilt at get_definitions() time)",
+            },
+            "model": {
+                "type": "string",
                 "description": "(rebuilt at get_definitions() time)",
             },
             "background": {
@@ -3941,6 +4370,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        model=args.get("model"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
