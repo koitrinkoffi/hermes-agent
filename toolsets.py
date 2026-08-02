@@ -104,6 +104,18 @@ _HERMES_CORE_TOOLS = [
     # stays deferred (destructive; still reachable via tool_search when needed).
     "localpass_get", "localpass_search", "localpass_store",
     "localpass_update", "localpass_status",
+    # Email (himalaya plugin) — the four entry points, pinned for the same
+    # reason as localpass, and more sharply: the himalaya SKILL was deleted
+    # when the plugin replaced it, so nothing in the base prompt hints that
+    # this agent can do email at all. Without a visible tool the failure mode
+    # is silent — "I don't have email access", or improvised himalaya CLI
+    # flags through the terminal. These four cover both intents a user
+    # expresses ("check my mail" / "send X an email"); once any of them is
+    # visible the `himalaya_*` namespace is discoverable, so the other eight
+    # (reply, forward, move, flag, mailbox_list, attachment_*, account_check)
+    # stay deferred and reachable via tool_search.
+    "himalaya_envelope_list", "himalaya_envelope_search",
+    "himalaya_message_read", "himalaya_message_compose",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
