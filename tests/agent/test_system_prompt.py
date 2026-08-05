@@ -234,7 +234,7 @@ _CONTEXT = "CONTEXT_FILES_SENTINEL"
 
 def _build(builder, **overrides):
     """Run a build_* function with skills + context files present."""
-    agent = _make_agent(valid_tool_names=["skills_list"], **overrides)
+    agent = _make_agent(**{"valid_tool_names": ["skills_list"], **overrides})
     with (
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
