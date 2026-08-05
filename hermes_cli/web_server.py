@@ -2390,15 +2390,21 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     try:
-        entries = [
-            _managed_file_entry(policy, child)
-            for child in target.iterdir()
-            if not _is_sensitive_path(child)
-        ]
+        children = [child for child in target.iterdir() if not _is_sensitive_path(child)]
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not read directory: {exc}")
+
+    entries = []
+    for child in children:
+        try:
+            entries.append(_managed_file_entry(policy, child))
+        except HTTPException:
+            # Entry vanished (or became unreadable) between iterdir() and stat() —
+            # e.g. a self-updating app swapping files mid-listing. One racy entry
+            # must not 500 the whole directory view.
+            continue
 
     entries.sort(key=lambda item: (not item["is_directory"], str(item["name"]).lower()))
     locked_root = policy.locked_root
