@@ -36,6 +36,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
 
+from agent.secret_scope import get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
@@ -81,16 +82,16 @@ def _get_command_timeout() -> int:
 
 
 def _auth_headers() -> Dict[str, str]:
-    """Return auth headers for Camofox when an API key is configured."""
-    api_key = os.getenv("CAMOFOX_API_KEY", "").strip()
-    if not api_key:
-        return {}
-    return {"Authorization": f"Bearer {api_key}"}
+    """Return Authorization header when CAMOFOX_API_KEY is set."""
+    key = (get_secret("CAMOFOX_API_KEY", "") or "").strip()
+    if key:
+        return {"Authorization": f"Bearer {key}"}
+    return {}
 
 
 def get_camofox_url() -> str:
     """Return the configured Camofox server URL, or empty string."""
-    return os.getenv("CAMOFOX_URL", "").rstrip("/")
+    return (get_secret("CAMOFOX_URL", "") or "").rstrip("/")
 
 
 def _config_cdp_url() -> str:
@@ -191,12 +192,15 @@ def _camofox_identity_override(task_id: Optional[str], camofox_cfg: Dict[str, An
     so Hermes operates in the same browser profile instead of creating a
     separate private session.
     """
-    user_id = os.getenv("CAMOFOX_USER_ID", "").strip() or str(camofox_cfg.get("user_id") or "").strip()
+    user_id = (
+        (get_secret("CAMOFOX_USER_ID", "") or "").strip()
+        or str(camofox_cfg.get("user_id") or "").strip()
+    )
     if not user_id:
         return None
 
     session_key = (
-        os.getenv("CAMOFOX_SESSION_KEY", "").strip()
+        (get_secret("CAMOFOX_SESSION_KEY", "") or "").strip()
         or str(camofox_cfg.get("session_key") or "").strip()
         or f"task_{(task_id or 'default')[:16]}"
     )
@@ -714,73 +718,6 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
 
 
-def camofox_upload(target: str, paths: list, task_id: Optional[str] = None) -> str:
-    """Upload local files to a file input via Camofox.
-
-    ``target`` is an already-normalized upload target (an ``@eN`` ref or a raw
-    CSS selector, per ``_normalize_upload_target``). Paths are sent as-is; the
-    Camofox server reads them off the shared local filesystem.
-    """
-    try:
-        session = _get_session(task_id)
-        if not session["tab_id"]:
-            return tool_error("No browser session. Call browser_navigate first.", success=False)
-
-        body: Dict[str, Any] = {"userId": session["user_id"], "paths": list(paths)}
-        clean = (target or "").strip()
-        # _normalize_upload_target always prefixes refs with "@"; anything else is a selector.
-        if clean.startswith("@"):
-            body["ref"] = clean.lstrip("@")
-        else:
-            body["selector"] = clean
-
-        _post(
-            f"/tabs/{session['tab_id']}/upload",
-            body,
-            timeout=max(_DEFAULT_TIMEOUT, 60),
-        )
-        return json.dumps({
-            "success": True,
-            "element": target,
-            "uploaded_paths": list(paths),
-        }, ensure_ascii=False)
-    except Exception as e:
-        return tool_error(str(e), success=False)
-
-
-def camofox_dropzone_upload(selector: str, paths: list, task_id: Optional[str] = None) -> str:
-    """Attach local files to a Dropzone.js-style drag-drop uploader via Camofox.
-
-    For widgets where a plain file input isn't reachable (Dropzone, etc.). The
-    server tries the native file chooser, hidden-input setInputFiles, and a
-    synthetic drop (file injected via the evaluate-arg channel), verifying an
-    actual upload signal and reporting which strategy worked.
-    """
-    try:
-        session = _get_session(task_id)
-        if not session["tab_id"]:
-            return tool_error("No browser session. Call browser_navigate first.", success=False)
-
-        body: Dict[str, Any] = {
-            "userId": session["user_id"],
-            "selector": (selector or ".dropzone").strip() or ".dropzone",
-            "paths": list(paths),
-        }
-        data = _post(
-            f"/tabs/{session['tab_id']}/dropzone-upload",
-            body,
-            timeout=max(_DEFAULT_TIMEOUT, 90),
-        )
-        return json.dumps({
-            "success": True,
-            "selector": body["selector"],
-            "uploaded_paths": list(paths),
-            "strategy": data.get("strategy") if isinstance(data, dict) else None,
-        }, ensure_ascii=False)
-    except Exception as e:
-        return tool_error(str(e), success=False)
-
-
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
     """Scroll the page via Camofox."""
     try:
@@ -793,122 +730,6 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
             {"userId": session["user_id"], "direction": direction},
         )
         return json.dumps({"success": True, "scrolled": direction})
-    except Exception as e:
-        return tool_error(str(e), success=False)
-
-
-def camofox_mouse_wheel(
-    delta_y: float = 0,
-    delta_x: float = 0,
-    ref: Optional[str] = None,
-    x: Optional[float] = None,
-    y: Optional[float] = None,
-    task_id: Optional[str] = None,
-) -> str:
-    """Real mouse wheel at an element (ref), coordinates, or viewport centre via Camofox."""
-    try:
-        session = _get_session(task_id)
-        if not session["tab_id"]:
-            return tool_error("No browser session. Call browser_navigate first.", success=False)
-        if not delta_x and not delta_y:
-            return tool_error("browser_mouse_wheel needs a non-zero delta_x or delta_y.", success=False)
-
-        body: Dict[str, Any] = {
-            "userId": session["user_id"],
-            "deltaX": delta_x,
-            "deltaY": delta_y,
-        }
-        if ref:
-            body["ref"] = str(ref).lstrip("@")
-        elif x is not None and y is not None:
-            body["x"], body["y"] = x, y
-
-        data = _post(
-            f"/tabs/{session['tab_id']}/mouse-wheel",
-            body,
-            timeout=max(_DEFAULT_TIMEOUT, 30),
-        )
-        return json.dumps({
-            "success": True,
-            "x": data.get("x") if isinstance(data, dict) else None,
-            "y": data.get("y") if isinstance(data, dict) else None,
-            "deltaX": delta_x,
-            "deltaY": delta_y,
-        })
-    except Exception as e:
-        return tool_error(str(e), success=False)
-
-
-def camofox_drag(
-    from_ref: Optional[str] = None,
-    to_ref: Optional[str] = None,
-    from_x: Optional[float] = None,
-    from_y: Optional[float] = None,
-    to_x: Optional[float] = None,
-    to_y: Optional[float] = None,
-    from_selector: Optional[str] = None,
-    to_selector: Optional[str] = None,
-    waypoints: Optional[list] = None,
-    steps: Optional[int] = None,
-    hold_ms: Optional[int] = None,
-    release_delay_ms: Optional[int] = None,
-    humanize: Optional[bool] = None,
-    button: Optional[str] = None,
-    task_id: Optional[str] = None,
-) -> str:
-    """Press-move-release mouse drag via Camofox (general-purpose drag-and-drop)."""
-    try:
-        session = _get_session(task_id)
-        if not session["tab_id"]:
-            return tool_error("No browser session. Call browser_navigate first.", success=False)
-
-        body: Dict[str, Any] = {"userId": session["user_id"]}
-        # Start point: ref | selector | coords
-        if from_ref:
-            body["fromRef"] = str(from_ref).lstrip("@")
-        elif from_selector:
-            body["fromSelector"] = from_selector
-        if from_x is not None and from_y is not None:
-            body["fromX"], body["fromY"] = from_x, from_y
-        # End point: ref | selector | coords
-        if to_ref:
-            body["toRef"] = str(to_ref).lstrip("@")
-        elif to_selector:
-            body["toSelector"] = to_selector
-        if to_x is not None and to_y is not None:
-            body["toX"], body["toY"] = to_x, to_y
-        # Optional motion controls
-        if waypoints:
-            body["waypoints"] = waypoints
-        if steps is not None:
-            body["steps"] = steps
-        if hold_ms is not None:
-            body["holdMs"] = hold_ms
-        if release_delay_ms is not None:
-            body["releaseDelayMs"] = release_delay_ms
-        if humanize is not None:
-            body["humanize"] = humanize
-        if button:
-            body["button"] = button
-
-        has_start = ("fromRef" in body) or ("fromSelector" in body) or ("fromX" in body)
-        has_end = ("toRef" in body) or ("toSelector" in body) or ("toX" in body)
-        if not has_start or not has_end:
-            return tool_error(
-                "browser_drag needs a start and an end point — each as a ref, a selector, or x/y coordinates.",
-                success=False,
-            )
-
-        data = _post(
-            f"/tabs/{session['tab_id']}/drag",
-            body,
-            timeout=max(_DEFAULT_TIMEOUT, 45),
-        )
-        return json.dumps({
-            "success": True,
-            "from": data.get("from") if isinstance(data, dict) else None,
-            "to": data.get("to") if isinstance(data, dict) else None,
-        })
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -1130,3 +951,188 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
 
 
 
+
+
+# ---- Local-mod tools preserved across upstream sync (Camofox backend) ----
+
+def camofox_upload(target: str, paths: list, task_id: Optional[str] = None) -> str:
+    """Upload local files to a file input via Camofox.
+
+    ``target`` is an already-normalized upload target (an ``@eN`` ref or a raw
+    CSS selector, per ``_normalize_upload_target``). Paths are sent as-is; the
+    Camofox server reads them off the shared local filesystem.
+    """
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+
+        body: Dict[str, Any] = {"userId": session["user_id"], "paths": list(paths)}
+        clean = (target or "").strip()
+        # _normalize_upload_target always prefixes refs with "@"; anything else is a selector.
+        if clean.startswith("@"):
+            body["ref"] = clean.lstrip("@")
+        else:
+            body["selector"] = clean
+
+        _post(
+            f"/tabs/{session['tab_id']}/upload",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 60),
+        )
+        return json.dumps({
+            "success": True,
+            "element": target,
+            "uploaded_paths": list(paths),
+        }, ensure_ascii=False)
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
+def camofox_dropzone_upload(selector: str, paths: list, task_id: Optional[str] = None) -> str:
+    """Attach local files to a Dropzone.js-style drag-drop uploader via Camofox.
+
+    For widgets where a plain file input isn't reachable (Dropzone, etc.). The
+    server tries the native file chooser, hidden-input setInputFiles, and a
+    synthetic drop (file injected via the evaluate-arg channel), verifying an
+    actual upload signal and reporting which strategy worked.
+    """
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+
+        body: Dict[str, Any] = {
+            "userId": session["user_id"],
+            "selector": (selector or ".dropzone").strip() or ".dropzone",
+            "paths": list(paths),
+        }
+        data = _post(
+            f"/tabs/{session['tab_id']}/dropzone-upload",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 90),
+        )
+        return json.dumps({
+            "success": True,
+            "selector": body["selector"],
+            "uploaded_paths": list(paths),
+            "strategy": data.get("strategy") if isinstance(data, dict) else None,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
+def camofox_drag(
+    from_ref: Optional[str] = None,
+    to_ref: Optional[str] = None,
+    from_x: Optional[float] = None,
+    from_y: Optional[float] = None,
+    to_x: Optional[float] = None,
+    to_y: Optional[float] = None,
+    from_selector: Optional[str] = None,
+    to_selector: Optional[str] = None,
+    waypoints: Optional[list] = None,
+    steps: Optional[int] = None,
+    hold_ms: Optional[int] = None,
+    release_delay_ms: Optional[int] = None,
+    humanize: Optional[bool] = None,
+    button: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Press-move-release mouse drag via Camofox (general-purpose drag-and-drop)."""
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+
+        body: Dict[str, Any] = {"userId": session["user_id"]}
+        # Start point: ref | selector | coords
+        if from_ref:
+            body["fromRef"] = str(from_ref).lstrip("@")
+        elif from_selector:
+            body["fromSelector"] = from_selector
+        if from_x is not None and from_y is not None:
+            body["fromX"], body["fromY"] = from_x, from_y
+        # End point: ref | selector | coords
+        if to_ref:
+            body["toRef"] = str(to_ref).lstrip("@")
+        elif to_selector:
+            body["toSelector"] = to_selector
+        if to_x is not None and to_y is not None:
+            body["toX"], body["toY"] = to_x, to_y
+        # Optional motion controls
+        if waypoints:
+            body["waypoints"] = waypoints
+        if steps is not None:
+            body["steps"] = steps
+        if hold_ms is not None:
+            body["holdMs"] = hold_ms
+        if release_delay_ms is not None:
+            body["releaseDelayMs"] = release_delay_ms
+        if humanize is not None:
+            body["humanize"] = humanize
+        if button:
+            body["button"] = button
+
+        has_start = ("fromRef" in body) or ("fromSelector" in body) or ("fromX" in body)
+        has_end = ("toRef" in body) or ("toSelector" in body) or ("toX" in body)
+        if not has_start or not has_end:
+            return tool_error(
+                "browser_drag needs a start and an end point — each as a ref, a selector, or x/y coordinates.",
+                success=False,
+            )
+
+        data = _post(
+            f"/tabs/{session['tab_id']}/drag",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 45),
+        )
+        return json.dumps({
+            "success": True,
+            "from": data.get("from") if isinstance(data, dict) else None,
+            "to": data.get("to") if isinstance(data, dict) else None,
+        })
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
+def camofox_mouse_wheel(
+    delta_y: float = 0,
+    delta_x: float = 0,
+    ref: Optional[str] = None,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Real mouse wheel at an element (ref), coordinates, or viewport centre via Camofox."""
+    try:
+        session = _get_session(task_id)
+        if not session["tab_id"]:
+            return tool_error("No browser session. Call browser_navigate first.", success=False)
+        if not delta_x and not delta_y:
+            return tool_error("browser_mouse_wheel needs a non-zero delta_x or delta_y.", success=False)
+
+        body: Dict[str, Any] = {
+            "userId": session["user_id"],
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+        }
+        if ref:
+            body["ref"] = str(ref).lstrip("@")
+        elif x is not None and y is not None:
+            body["x"], body["y"] = x, y
+
+        data = _post(
+            f"/tabs/{session['tab_id']}/mouse-wheel",
+            body,
+            timeout=max(_DEFAULT_TIMEOUT, 30),
+        )
+        return json.dumps({
+            "success": True,
+            "x": data.get("x") if isinstance(data, dict) else None,
+            "y": data.get("y") if isinstance(data, dict) else None,
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+        })
+    except Exception as e:
+        return tool_error(str(e), success=False)

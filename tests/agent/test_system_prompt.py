@@ -228,46 +228,70 @@ class TestTelegramRichMessagesHint:
         assert "lean into it" not in stable
 
 
-def _stable_prompt_with_skills(agent, skills_sentinel):
-    """Like _stable_prompt but stubs the full skills-index builder with a
-    sentinel so we can assert whether the branch called it or not, without
-    depending on which skills happen to be on disk."""
+_SKILLS = "SKILLS_INDEX_SENTINEL"
+_CONTEXT = "CONTEXT_FILES_SENTINEL"
+
+
+def _build(builder, **overrides):
+    """Run a build_* function with skills + context files present."""
+    agent = _make_agent(valid_tool_names=["skills_list"], **overrides)
     with (
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
-        patch("run_agent.build_context_files_prompt", return_value=""),
-        patch("run_agent.build_skills_system_prompt", return_value=skills_sentinel),
+        patch("run_agent.build_context_files_prompt", return_value=_CONTEXT),
+        patch("run_agent.get_toolset_for_tool", return_value=None),
+        patch("run_agent.build_skills_system_prompt", return_value=_SKILLS),
     ):
-        return build_system_prompt_parts(agent)["stable"]
+        return builder(agent)
+
+
+class TestSkillsInVolatileBand:
+    """The skills index is runtime-mutable, so it lives in the volatile band,
+    not the stable band, to keep the cached stable prefix reusable when a
+    rebuild picks up a skill change."""
+
+    def test_skills_not_in_stable_band(self):
+        parts = _build(build_system_prompt_parts)
+        assert _SKILLS not in parts["stable"]
+
+    def test_skills_lead_the_volatile_band(self):
+        parts = _build(build_system_prompt_parts)
+        assert parts["volatile"].startswith(_SKILLS)
+
+    def test_full_order_is_stable_context_then_skills(self):
+        # build_system_prompt joins stable + context + volatile, so the skills
+        # index renders after the context files and before the per-turn
+        # memory/timestamp tail.
+        full = _build(build_system_prompt)
+        assert full.index(_CONTEXT) < full.index(_SKILLS)
+        assert full.index(_SKILLS) < full.index("Conversation started:")
 
 
 class TestSubagentSkillsPointer:
     """Delegated children (platform='subagent') get a lean skills pointer, not
-    the full <available_skills> index. See the mods-checkpoint tag rationale."""
-
-    SENTINEL = "<available_skills>\n  FULL_INDEX\n</available_skills>"
+    the full <available_skills> index. Local mod — see the
+    mods-checkpoint-2026.07.22-pre-lean-subagent-prompt tag rationale. The
+    pointer follows the skills index into the volatile band (skills are
+    runtime-mutable), so assertions target the volatile part."""
 
     def test_subagent_gets_pointer_not_full_index(self):
-        agent = _make_agent(valid_tool_names=["skills_list"], platform="subagent")
-        stable = _stable_prompt_with_skills(agent, self.SENTINEL)
-        # Lean pointer present, real tool names present
-        assert "## Skills (available on demand)" in stable
-        assert "skills_list" in stable
-        assert "skill_view" in stable
+        parts = _build(build_system_prompt_parts, platform="subagent")
+        volatile = parts["volatile"]
+        assert "## Skills (available on demand)" in volatile
+        assert "skills_list" in volatile
+        assert "skill_view" in volatile
         # Full pushed index absent (builder must NOT be spliced in for children)
-        assert self.SENTINEL not in stable
-        assert "## Skills (mandatory)" not in stable
+        assert _SKILLS not in volatile
+        assert _SKILLS not in parts["stable"]
 
     def test_main_agent_still_gets_full_index(self):
-        agent = _make_agent(valid_tool_names=["skills_list"], platform="cli")
-        stable = _stable_prompt_with_skills(agent, self.SENTINEL)
-        # Main agent path unchanged: full index spliced in, no lean pointer
-        assert self.SENTINEL in stable
-        assert "## Skills (available on demand)" not in stable
+        parts = _build(build_system_prompt_parts, platform="cli")
+        assert _SKILLS in parts["volatile"]
+        assert "## Skills (available on demand)" not in parts["volatile"]
 
     def test_subagent_without_skills_tool_gets_neither(self):
-        agent = _make_agent(valid_tool_names=["read_file"], platform="subagent")
-        stable = _stable_prompt_with_skills(agent, self.SENTINEL)
-        assert "## Skills (available on demand)" not in stable
-        assert self.SENTINEL not in stable
+        parts = _build(build_system_prompt_parts, platform="subagent",
+                       valid_tool_names=["read_file"])
+        assert "## Skills (available on demand)" not in parts["volatile"]
+        assert _SKILLS not in parts["volatile"]

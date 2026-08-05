@@ -20,7 +20,7 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 import { CodeEditor } from '@/components/chat/code-editor'
 import { Button } from '@/components/ui/button'
@@ -59,6 +59,7 @@ import {
   setShowAllProfiles,
   sortByProfileOrder
 } from '@/store/profile'
+import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
 import type { ProfileInfo } from '@/types/hermes'
 
 import { CreateProfileDialog } from '../../profiles/create-profile-dialog'
@@ -264,6 +265,7 @@ export function ProfileRail() {
             profiles={named}
           />
           <AddProfileButton label={p.newProfile} onClick={() => setCreateOpen(true)} />
+          <ImportProfileButton label={p.importProfile} />
         </div>
       ) : (
         <div
@@ -302,6 +304,7 @@ export function ProfileRail() {
           )}
 
           <AddProfileButton label={p.newProfile} onClick={() => setCreateOpen(true)} />
+          <ImportProfileButton label={p.importProfile} />
         </div>
       )}
 
@@ -430,6 +433,24 @@ function AddProfileButton({ label, onClick }: { label: string; onClick: () => vo
         type="button"
       >
         <Codicon name="add" size="0.75rem" />
+      </button>
+    </Tip>
+  )
+}
+
+// Import-archive door beside the "+": adopt a shared profile bundle (theme,
+// skills, layout) as a new profile. Same chrome as AddProfileButton; the whole
+// flow (picker → import → apply overlay → switch) lives in the store.
+function ImportProfileButton({ label }: { label: string }) {
+  return (
+    <Tip label={label}>
+      <button
+        aria-label={label}
+        className="grid size-5 shrink-0 place-items-center rounded-[3px] text-(--ui-text-tertiary) opacity-55 transition hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100"
+        onClick={() => void runImportProfileFlow()}
+        type="button"
+      >
+        <Codicon name="cloud-download" size="0.75rem" />
       </button>
     </Tip>
   )
@@ -672,7 +693,7 @@ function ProfileSquare({
         {/* The rail sits at the very bottom, so pad off the chrome (esp. the
             statusbar) — Radix then flips the menu up instead of squishing it. */}
         <ContextMenuContent
-          aria-label={p.actionsFor(label)}
+          aria-label={p.actions}
           className="w-40"
           collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }}
           // Menu close refocuses the trigger — which doubles as the popover
@@ -692,6 +713,10 @@ function ProfileSquare({
             <Codicon name="edit" size="0.875rem" />
             <span>{p.editSoul}</span>
           </ContextMenuItem>
+          <ContextMenuItem onSelect={() => void runExportProfileFlow(label)}>
+            <Codicon name="package" size="0.875rem" />
+            <span>{p.exportProfile}</span>
+          </ContextMenuItem>
           <ContextMenuItem
             className="text-destructive focus:text-destructive"
             onSelect={onDelete}
@@ -704,7 +729,7 @@ function ProfileSquare({
       </ContextMenu>
 
       <PopoverContent
-        aria-label={p.colorFor(label)}
+        aria-label={p.colorFor}
         className="w-auto p-2"
         collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }}
         side="top"

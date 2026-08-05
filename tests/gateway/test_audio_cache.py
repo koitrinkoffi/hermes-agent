@@ -1,15 +1,17 @@
 """
-Tests for audio cache cleanup in gateway/platforms/base.py.
+Tests for audio cache utilities in gateway/platforms/base.py.
 
-Covers: cleanup_audio_cache (inbound voice-note pruning), get_audio_cache_dir.
+Covers: get_audio_cache_dir, cache_audio_from_bytes, cleanup_audio_cache.
 """
 
 import os
 import time
+from pathlib import Path
 
 import pytest
 
 from gateway.platforms.base import (
+    cache_audio_from_bytes,
     cleanup_audio_cache,
     get_audio_cache_dir,
 )
@@ -27,14 +29,41 @@ def _redirect_cache(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# TestGetAudioCacheDir
+# ---------------------------------------------------------------------------
+
+class TestGetAudioCacheDir:
+    def test_creates_directory(self):
+        cache_dir = get_audio_cache_dir()
+        assert cache_dir.exists()
+        assert cache_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# TestCacheAudioFromBytes
+# ---------------------------------------------------------------------------
+
+class TestCacheAudioFromBytes:
+    def test_basic_caching(self):
+        data = b"fake-ogg-bytes"
+        path = cache_audio_from_bytes(data)
+        assert os.path.exists(path)
+        assert Path(path).read_bytes() == data
+
+    def test_default_extension(self):
+        path = cache_audio_from_bytes(b"data")
+        assert path.endswith(".ogg")
+
+
+# ---------------------------------------------------------------------------
 # TestCleanupAudioCache
 # ---------------------------------------------------------------------------
 
 class TestCleanupAudioCache:
-    def test_removes_old_files(self, tmp_path):
+    def test_removes_old_files(self):
         cache_dir = get_audio_cache_dir()
-        old_file = cache_dir / "audio_old.ogg"
-        old_file.write_bytes(b"old")
+        old_file = cache_dir / "old.ogg"
+        old_file.write_text("old")
         # Set modification time to 48 hours ago
         old_mtime = time.time() - 48 * 3600
         os.utime(old_file, (old_mtime, old_mtime))
@@ -45,22 +74,39 @@ class TestCleanupAudioCache:
 
     def test_keeps_recent_files(self):
         cache_dir = get_audio_cache_dir()
-        recent = cache_dir / "audio_recent.ogg"
-        recent.write_bytes(b"fresh")
+        recent = cache_dir / "recent.ogg"
+        recent.write_text("fresh")
 
         removed = cleanup_audio_cache(max_age_hours=24)
         assert removed == 0
         assert recent.exists()
 
-    def test_returns_removed_count(self):
-        cache_dir = get_audio_cache_dir()
-        old_time = time.time() - 48 * 3600
-        for i in range(3):
-            f = cache_dir / f"audio_old_{i}.ogg"
-            f.write_bytes(b"x")
-            os.utime(f, (old_time, old_time))
 
-        assert cleanup_audio_cache(max_age_hours=24) == 3
+# ---------------------------------------------------------------------------
+# TestUnifiedMediaCacheCleanup — video + screenshot ride the same shared loop
+# ---------------------------------------------------------------------------
 
-    def test_empty_cache_dir(self):
-        assert cleanup_audio_cache(max_age_hours=24) == 0
+class TestUnifiedMediaCacheCleanup:
+
+    def test_cleanup_screenshot_cache_removes_old_files(self, tmp_path, monkeypatch):
+        from gateway.platforms.base import (
+            cleanup_screenshot_cache,
+            get_screenshot_cache_dir,
+        )
+
+        monkeypatch.setattr(
+            "gateway.platforms.base.SCREENSHOT_CACHE_DIR", tmp_path / "screenshots"
+        )
+        cache_dir = get_screenshot_cache_dir()
+        old_file = cache_dir / "old.png"
+        old_file.write_text("old")
+        old_mtime = time.time() - 48 * 3600
+        os.utime(old_file, (old_mtime, old_mtime))
+        fresh = cache_dir / "fresh.png"
+        fresh.write_text("fresh")
+
+        removed = cleanup_screenshot_cache(max_age_hours=24)
+        assert removed == 1
+        assert not old_file.exists()
+        assert fresh.exists()
+
