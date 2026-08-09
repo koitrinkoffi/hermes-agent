@@ -787,6 +787,65 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+# ── Local mod: named subagent types (delegate_task agent_type=...) ──────
+# A type is a file ~/.hermes/agents/<name>.md: YAML frontmatter + body.
+# Frontmatter keys:
+#   tools: 'none' (child gets ZERO tools) or a list/comma-string of
+#          toolsets (whitelist — can only restrict vs the parent, never
+#          widen; the existing intersection logic enforces that).
+#   sync:  true → the dispatch runs this delegation synchronously and the
+#          child's text IS the tool result (no background handle).
+#   model: default model id for this type; a per-call `model` still wins.
+# The body REPLACES the generic child scaffold entirely: it becomes the
+# child's whole system prompt, followed only by YOUR TASK / CONTEXT.
+def _load_agent_type(name: str) -> Dict[str, Any]:
+    import yaml as _yaml
+    from hermes_constants import get_hermes_home
+
+    agents_dir = get_hermes_home() / "agents"
+    path = agents_dir / f"{name}.md"
+    if not path.is_file():
+        try:
+            available = sorted(p.stem for p in agents_dir.glob("*.md"))
+        except OSError:
+            available = []
+        raise ValueError(
+            f"Unknown agent_type {name!r}. Available: "
+            f"{', '.join(available) or '(none defined)'} — define types as "
+            f"{agents_dir}/<name>.md. Omit 'agent_type' for a generic subagent."
+        )
+    raw = path.read_text(encoding="utf-8")
+    meta: Dict[str, Any] = {}
+    body = raw
+    if raw.startswith("---"):
+        end = raw.find("\n---", 3)
+        if end != -1:
+            try:
+                meta = _yaml.safe_load(raw[3:end]) or {}
+            except Exception as exc:
+                raise ValueError(f"agent_type {name!r}: invalid frontmatter: {exc}")
+            body = raw[end + 4 :]
+    tools = meta.get("tools")
+    if isinstance(tools, str):
+        tools = tools.strip()
+        if tools.lower() == "none":
+            tools = "none"
+        else:
+            tools = [t.strip() for t in tools.split(",") if t.strip()]
+    elif tools is not None and not isinstance(tools, list):
+        raise ValueError(
+            f"agent_type {name!r}: 'tools' must be 'none' or a list of toolsets"
+        )
+    model = meta.get("model")
+    return {
+        "name": name,
+        "tools": tools,  # None = inherit parent, 'none' = no tools, list = whitelist
+        "sync": bool(meta.get("sync", False)),
+        "model": str(model).strip() if model else None,
+        "prompt": body.strip(),
+    }
+
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
@@ -795,6 +854,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    type_prompt: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -804,6 +864,14 @@ def _build_child_system_prompt(
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
+    # Local mod: a typed child gets the type body as its whole scaffold —
+    # no summary-format block, no workspace rules, no orchestrator notes.
+    if type_prompt:
+        parts = [type_prompt, "", f"YOUR TASK:\n{goal}"]
+        if context and context.strip():
+            parts.append(f"\nCONTEXT:\n{context}")
+        return "\n".join(parts)
+
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
@@ -1215,6 +1283,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Local mod: resolved agent-type definition (see _load_agent_type).
+    agent_type_def: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1249,6 +1319,13 @@ def _build_child_agent(
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
+
+    # Local mod: agent-type tool policy. A whitelist rides the existing
+    # `toolsets` intersection path (restrict-only); 'none' is applied after
+    # the generic resolution below.
+    _type_tools = (agent_type_def or {}).get("tools")
+    if isinstance(_type_tools, list) and _type_tools and not toolsets:
+        toolsets = list(_type_tools)
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1316,6 +1393,12 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Local mod: agent-type 'tools: none' → the child gets ZERO tools
+    # (enabled_toolsets=[] is honored as "nothing" by model_tools, unlike
+    # None which means "all"). Pure text-in/text-out child.
+    if _type_tools == "none":
+        child_toolsets = []
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
@@ -1324,6 +1407,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        type_prompt=(agent_type_def or {}).get("prompt"),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1546,6 +1630,11 @@ def _build_child_agent(
             **child_optional_kwargs,
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if agent_type_def:
+        # Local mod: typed children run on a bare system prompt — the type
+        # body (delivered via ephemeral_system_prompt) is the whole scaffold.
+        # build_system_prompt_parts returns empty tiers when this flag is set.
+        child._bare_prompt = True
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -2786,6 +2875,7 @@ def delegate_task(
     background: Optional[bool] = None,
     parent_agent=None,
     model: Optional[str] = None,
+    agent_type: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2904,14 +2994,33 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    # Local mod: named agent types. Per-task 'agent_type' beats the top-level
+    # one. Unknown names are rejected up front with the list of defined types.
+    type_cache: Dict[str, Dict[str, Any]] = {}
+    task_types: List[Optional[Dict[str, Any]]] = []
+    for task in task_list:
+        _type_name = str(task.get("agent_type") or agent_type or "").strip()
+        if not _type_name:
+            task_types.append(None)
+            continue
+        if _type_name not in type_cache:
+            try:
+                type_cache[_type_name] = _load_agent_type(_type_name)
+            except ValueError as exc:
+                return tool_error(str(exc))
+        task_types.append(type_cache[_type_name])
+
     # Per-call model override: per-task 'model' beats the top-level one, which
-    # beats delegation.model from config (already folded into `creds`). Each
-    # distinct override string is resolved once — validating a batch that all
-    # picks the same model costs a single catalog lookup.
+    # beats the agent type's default model, which beats delegation.model from
+    # config (already folded into `creds`). Each distinct override string is
+    # resolved once — validating a batch that all picks the same model costs a
+    # single catalog lookup.
     override_cache: Dict[str, dict] = {}
     task_creds: List[dict] = []
-    for task in task_list:
-        raw_model = _clean_model_str(task.get("model") or model)
+    for task, task_type in zip(task_list, task_types):
+        raw_model = _clean_model_str(
+            task.get("model") or model or ((task_type or {}).get("model"))
+        )
         if not raw_model:
             task_creds.append(creds)
             continue
@@ -2976,7 +3085,10 @@ def delegate_task(
             context=t.get("context"),
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
+            # Local mod: an agent_type MAY restrict them (whitelist/'none')
+            # via agent_type_def — restriction only, never widening.
             toolsets=None,
+            agent_type_def=task_types[i],
             model=t_creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
@@ -4242,6 +4354,14 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "description": "(rebuilt at get_definitions() time)",
                         },
+                        "agent_type": {
+                            "type": "string",
+                            "description": (
+                                "Per-task agent type, beating the top-level "
+                                "'agent_type'. Synchronous execution is decided "
+                                "by the TOP-LEVEL type only."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4258,6 +4378,20 @@ DELEGATE_TASK_SCHEMA = {
             "model": {
                 "type": "string",
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "agent_type": {
+                "type": "string",
+                "description": (
+                    "Named subagent type defined in ~/.hermes/agents/<name>.md "
+                    "(e.g. 'writer', 'reader'). Replaces the child's generic "
+                    "scaffold with the type's own prompt, applies its tool "
+                    "whitelist ('none' = pure text-in/text-out child) and its "
+                    "default model, and — when the type sets sync — runs the "
+                    "delegation synchronously so the child's text comes back "
+                    "directly as this tool call's result. Unknown names are "
+                    "rejected with the list of defined types. Omit for a "
+                    "generic subagent."
+                ),
             },
             "background": {
                 "type": "boolean",

@@ -7653,7 +7653,20 @@ class AIAgent:
         #     its own turn to compose a summary, and a subagent doesn't own the
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
+        # Local mod: a top-level `agent_type` whose definition sets sync=true
+        # forces synchronous execution — the child's text is returned directly
+        # as the tool result (Claude Code-style blocking subagent call), which
+        # closes the "parent acts while the draft is pending" failure mode.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _sync_type = False
+        _agent_type = function_args.get("agent_type")
+        if _agent_type:
+            try:
+                from tools.delegate_tool import _load_agent_type
+                _sync_type = bool(_load_agent_type(str(_agent_type).strip()).get("sync"))
+            except Exception:
+                # Unknown/invalid type: let delegate_task surface the error.
+                _sync_type = False
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
@@ -7661,7 +7674,8 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             model=function_args.get("model"),
-            background=(not _is_subagent),
+            agent_type=function_args.get("agent_type"),
+            background=(not _is_subagent) and not _sync_type,
             parent_agent=self,
         )
 

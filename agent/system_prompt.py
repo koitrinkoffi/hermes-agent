@@ -149,6 +149,25 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+# ── Local mod: per-block prompt override files ─────────────────────────
+# Any named block below can be replaced by ~/.hermes/prompts/<name>.md:
+# file present → its content replaces the upstream text; empty file → the
+# block is dropped; no file → upstream text unchanged. Keeps personal
+# prompt content as data (like SOUL.md) instead of code, so upstream syncs
+# never conflict with it. Block names: help_guidance, task_completion,
+# parallel_tool_calls, memory_guidance, session_search_guidance,
+# skills_guidance, steer_channel_note, tool_use_enforcement,
+# google_guidance, openai_guidance, profile_hint, skills_index.
+def _prompt_override(name: str, default: Optional[str]) -> Optional[str]:
+    try:
+        path = get_hermes_home() / "prompts" / f"{name}.md"
+        if path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return default
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -167,6 +186,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
+    # Local mod: typed subagents (delegate_task agent_type=...) run on a bare
+    # prompt — the agent-type file body, delivered as the ephemeral system
+    # prompt, is their whole scaffold. Skip every generic block.
+    if getattr(agent, "_bare_prompt", False):
+        return {"stable": "", "context": "", "volatile": ""}
+
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
@@ -201,7 +226,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    stable_parts.append(_prompt_override("help_guidance", HERMES_AGENT_HELP_GUIDANCE))
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -210,7 +235,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # config.yaml ``agent.task_completion_guidance`` (default True) so
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
-        stable_parts.append(TASK_COMPLETION_GUIDANCE)
+        stable_parts.append(_prompt_override("task_completion", TASK_COMPLETION_GUIDANCE))
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
     # independent tool calls into one assistant turn rather than emitting one
@@ -221,16 +246,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # conversation.  Gated by config.yaml ``agent.parallel_tool_call_guidance``
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
-        stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+        stable_parts.append(_prompt_override("parallel_tool_calls", PARALLEL_TOOL_CALL_GUIDANCE))
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
     if "memory" in agent.valid_tool_names:
-        tool_guidance.append(MEMORY_GUIDANCE)
+        tool_guidance.append(_prompt_override("memory_guidance", MEMORY_GUIDANCE))
     if "session_search" in agent.valid_tool_names:
-        tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        tool_guidance.append(_prompt_override("session_search_guidance", SESSION_SEARCH_GUIDANCE))
     if "skill_manage" in agent.valid_tool_names:
-        tool_guidance.append(SKILLS_GUIDANCE)
+        tool_guidance.append(_prompt_override("skills_guidance", SKILLS_GUIDANCE))
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
@@ -241,13 +266,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
+    tool_guidance = [g for g in tool_guidance if g]
     if tool_guidance:
-        stable_parts.append(" ".join(tool_guidance))
+        # Joined with blank lines (upstream used a single space) so that each
+        # block's markdown title starts its own section.
+        stable_parts.append("\n\n".join(tool_guidance))
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
     if agent.valid_tool_names:
-        stable_parts.append(STEER_CHANNEL_NOTE)
+        stable_parts.append(_prompt_override("steer_channel_note", STEER_CHANNEL_NOTE))
 
     # Computer-use — goes in as its own block rather than being merged into
     # tool_guidance because the content is multi-paragraph. The guidance is
@@ -282,19 +310,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             model_lower = (agent.model or "").lower()
             _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
         if _inject:
-            stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+            stable_parts.append(_prompt_override("tool_use_enforcement", TOOL_USE_ENFORCEMENT_GUIDANCE))
             _model_lower = (agent.model or "").lower()
             # Google model operational guidance (conciseness, absolute
             # paths, parallel tool calls, verify-before-edit, etc.)
             if "gemini" in _model_lower or "gemma" in _model_lower:
-                stable_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
+                stable_parts.append(_prompt_override("google_guidance", GOOGLE_MODEL_OPERATIONAL_GUIDANCE))
             # OpenAI GPT/Codex execution discipline (tool persistence,
             # prerequisite checks, verification, anti-hallucination).
             # Also applied to xAI Grok — same failure modes (claims completion
             # without tool calls, suggests workarounds instead of using
             # existing tools, replies with plans instead of executing).
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
-                stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+                stable_parts.append(_prompt_override("openai_guidance", OPENAI_MODEL_EXECUTION_GUIDANCE))
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools and getattr(agent, "platform", None) == "subagent":
@@ -334,11 +362,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
-        skills_prompt = _r.build_skills_system_prompt(
-            available_tools=agent.valid_tool_names,
-            available_toolsets=avail_toolsets,
-            compact_categories=_compact_cats or None,
-        )
+        # Local mod: ~/.hermes/prompts/skills_index.md replaces the whole
+        # generated index (e.g. with a curated core list + a search reflex);
+        # the full index stays reachable on demand via skills_list.
+        _skills_index_override = _prompt_override("skills_index", None)
+        if _skills_index_override is not None:
+            skills_prompt = _skills_index_override
+        else:
+            skills_prompt = _r.build_skills_system_prompt(
+                available_tools=agent.valid_tool_names,
+                available_toolsets=avail_toolsets,
+                compact_categories=_compact_cats or None,
+            )
     else:
         skills_prompt = ""
 
@@ -361,7 +396,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Stable for the lifetime of the process.
     _env_hints = _r.build_environment_hints()
     if _env_hints:
-        stable_parts.append(_env_hints)
+        # Local mod: title the dynamic environment facts so every prompt
+        # section is identifiable.
+        stable_parts.append("# Environment\n" + _env_hints)
 
     # Coding posture (base Hermes, any interactive coding surface in a code
     # workspace — see agent/coding_context.py). Keep the operating brief in
@@ -423,14 +460,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     except Exception:
         active_profile = "default"
     if active_profile == "default":
-        post_workspace_parts.append(
+        post_workspace_parts.append(_prompt_override(
+            "profile_hint",
             "Active Hermes profile: default. Other profiles (if any) live "
             "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
             "you to."
-        )
+        ))
     else:
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
@@ -556,7 +594,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    timestamp_line = f"# Session\nConversation started: {now.strftime('%A, %B %d, %Y')}"
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:
