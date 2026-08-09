@@ -29,25 +29,24 @@ from typing import List, Dict, Any, Set, Optional
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
+    # Core trim 2026-08-09 (hermes-mods): unpinned everything Koitrin's
+    # homelab never uses so the per-turn schema payload shrinks. Unpinned
+    # (all still reachable via tool_search/tool_call): desktop GUI tools,
+    # image_generate, bfl_flux3_* (video), ha_* (Home Assistant),
+    # kanban_*, computer_use, browser_dialog, skill_manage (Koitrin
+    # authors/curates skills himself — the model must not manage them),
+    # browser_drag, session_search (cross-session recall is Hindsight's
+    # job on this install).
     # Web
     "web_search", "web_extract",
     # Terminal + process management
     "terminal", "process",
-    # Desktop GUI affordances: read the embedded terminal pane, close an agent's
-    # read-only terminal tab, open a URL/file in the preview pane, focus a
-    # pane, and react to a message with an emoji (all gated on HERMES_DESKTOP
-    # via check_fn — hidden outside the GUI).
-    "read_terminal", "close_terminal", "open_preview", "focus_pane", "react_to_message",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
-    # Vision + image generation
-    "vision_analyze", "image_generate",
-    # BFL FLUX 3 video generation
-    "bfl_flux3_text_to_video", "bfl_flux3_image_to_video",
-    "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
-    "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
-    # Skills
-    "skills_list", "skill_view", "skill_manage",
+    # Vision
+    "vision_analyze",
+    # Skills (read-only pair; skill_manage deliberately deferred)
+    "skills_list", "skill_view",
     # Browser automation — the everyday-driving tools are pinned core so none
     # of THEM is deferred behind tool_search (a deferred wheel/tab/upload tool
     # it can't find falls back to a weaker one, e.g. page-level scroll on a
@@ -65,9 +64,9 @@ _HERMES_CORE_TOOLS = [
     # for interaction; use eval only to READ structured data"). browser_cdp /
     # browser_console stay OUT — they're genuinely rarely needed.
     "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_drag", "browser_back",
+    "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
-    "browser_vision", "browser_dialog", "browser_eval",
+    "browser_vision", "browser_eval",
     "browser_download", "browser_dropzone_upload",
     "browser_mouse", "browser_mouse_wheel", "browser_pdf",
     "browser_tab", "browser_upload",
@@ -80,27 +79,12 @@ _HERMES_CORE_TOOLS = [
     # move, so they live in the `project` toolset and are enabled solely by the
     # GUI gateway (tui_gateway/server.py::_load_enabled_toolsets) — keeping them
     # off every CLI/messaging/cron schema (narrow waist).
-    # Session history search
-    "session_search",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
-    # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
-    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # Kanban multi-agent coordination — only in schema when the agent is
-    # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
-    # profile explicitly enables the kanban toolset. Gated via check_fn in
-    # tools/kanban_tools.py.
-    "kanban_show", "kanban_list",
-    "kanban_complete", "kanban_block", "kanban_heartbeat",
-    "kanban_comment", "kanban_create", "kanban_link",
-    "kanban_unblock",
-    "kanban_attach", "kanban_attach_url", "kanban_attachments",
-    # Computer use (macOS, gated on cua-driver being installed via check_fn)
-    "computer_use",
     # Credential vault (localpass plugin) — pinned core so the vault tools stay
     # visible in the model schema instead of being deferred behind tool_search.
     # The agent must consult the vault before asking Koitrin for any login, and
