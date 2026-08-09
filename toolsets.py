@@ -35,8 +35,9 @@ _HERMES_CORE_TOOLS = [
     # image_generate, bfl_flux3_* (video), ha_* (Home Assistant),
     # kanban_*, computer_use, browser_dialog, skill_manage (Koitrin
     # authors/curates skills himself — the model must not manage them),
-    # browser_drag, session_search (cross-session recall is Hindsight's
-    # job on this install).
+    # browser_drag, browser_get_images, browser_mouse,
+    # browser_mouse_wheel, session_search (cross-session recall is
+    # Hindsight's job on this install).
     # Web
     "web_search", "web_extract",
     # Terminal + process management
@@ -65,10 +66,10 @@ _HERMES_CORE_TOOLS = [
     # browser_console stay OUT — they're genuinely rarely needed.
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_get_images",
+    "browser_press",
     "browser_vision", "browser_eval",
     "browser_download", "browser_dropzone_upload",
-    "browser_mouse", "browser_mouse_wheel", "browser_pdf",
+    "browser_pdf",
     "browser_tab", "browser_upload",
     # Text-to-speech
     "text_to_speech",
