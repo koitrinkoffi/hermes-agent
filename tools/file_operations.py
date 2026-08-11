@@ -903,7 +903,12 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # The sample is cut at a fixed BYTE count, so a multi-byte char can
+            # straddle the boundary and decode to U+FFFD purely because of the
+            # cut \u2014 a French text file has ~3% odds of that. Only trailing
+            # replacement chars can come from the truncation, so strip those
+            # before judging; any U+FFFD left is genuinely undecodable content.
+            if "\ufffd" in content_sample[:1000].rstrip("\ufffd"):
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
