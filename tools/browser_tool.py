@@ -555,6 +555,210 @@ def _get_cdp_override() -> str:
     return _resolve_cdp_override(raw)
 
 
+# ============================================================================
+# Managed local browser (hermes-mods, 2026-08-29)
+# ============================================================================
+#
+# The local Chromium is no longer launched *through* agent-browser as a child
+# of its daemon.  ``tools/browser_launcher`` starts it double-forked (PPID 1)
+# and we attach over CDP instead.  Consequences, all deliberate:
+#
+#   * No Hermes shutdown path can take the window down mid-task - not the
+#     ``atexit`` handler, not a gateway SIGKILL, not the orphan reaper's
+#     tree-kill - because the browser is in nobody's process tree.
+#   * ``close`` on a ``--cdp`` session only disconnects (measured on
+#     agent-browser 0.33.0 and 0.35.1), so the existing cleanup paths keep
+#     doing their legitimate work - reaping daemons - without touching it.
+#   * The browser is closed only on purpose, through CDP ``Browser.close``,
+#     which writes ``exit_type: "Normal"`` and ends the "restore pages?"
+#     bubble that a SIGKILLed Chromium produced on every restart.
+#
+# Nothing here disarms an upstream code path; the whole change is additive,
+# which keeps the merge surface of this mod down to a handful of insertions.
+
+#: HTTP CDP base URL of the browser this process manages, or None.
+_MANAGED_CDP_URL: Optional[str] = None
+#: Fixed agent-browser session name for the managed endpoint.  Upstream mints a
+#: random ``cdp_<uuid>`` per session key, which would spawn one daemon (plus
+#: socket dir and owner_pid file) per task - the local persistent-profile
+#: backend has always used one fixed name for exactly this reason.
+_MANAGED_CDP_SESSION_NAME = "hermes_cdp"
+_MANAGED_LAST_ACTIVITY: float = 0.0
+_MANAGED_TAB_FINGERPRINT: Optional[Tuple[str, ...]] = None
+#: Session keys that attached to an already-open browser and have not yet been
+#: handed the tab inventory.
+_PENDING_RESUME_HINT: set = set()
+_managed_lock = threading.Lock()
+
+
+def _managed_browser_applies() -> bool:
+    """Whether this install's browser is the local persistent-profile one.
+
+    Returns False when the operator pointed Hermes somewhere else (a manual
+    ``/browser connect``, a ``browser.cdp_url`` in config, a cloud provider,
+    Camofox).  An explicit human choice always wins over the managed path.
+    """
+    raw = _get_cdp_override_raw()
+    if raw and raw != _MANAGED_CDP_URL:
+        return False
+    try:
+        if _is_camofox_mode():
+            return False
+    except Exception:
+        pass
+    try:
+        if _get_cloud_provider() is not None:
+            return False
+    except Exception:
+        pass
+    try:
+        return bool(_get_local_browser_settings().get("profile_dir"))
+    except Exception:
+        return False
+
+
+def _is_managed_cdp_url(cdp_url: str) -> bool:
+    """True when *cdp_url* addresses the browser this process manages."""
+    if not _MANAGED_CDP_URL or not cdp_url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        return urlparse(cdp_url).port == urlparse(_MANAGED_CDP_URL).port
+    except Exception:
+        return False
+
+
+def _ensure_managed_browser(task_id: str) -> Optional[bool]:
+    """Guarantee a live browser and point ``BROWSER_CDP_URL`` at it.
+
+    Must run BEFORE ``_get_cdp_override()``: resolution performs
+    ``/json/version`` discovery with a 10s timeout, so pointing at a dead
+    endpoint reproduces the exact startup stall documented in
+    ``_get_cdp_override_raw``.  Publishing the URL through the environment
+    rather than ``config.yaml`` keeps the config honest - there is no
+    persistent claim that a CDP endpoint exists while the browser is closed,
+    which is its normal state here.
+
+    Best-effort: a launch failure logs and returns, leaving the caller on the
+    ordinary local session path rather than breaking the tool call.
+    """
+    global _MANAGED_CDP_URL, _MANAGED_LAST_ACTIVITY, _MANAGED_TAB_FINGERPRINT
+    if not _managed_browser_applies():
+        return None
+    try:
+        from tools import browser_launcher
+        base, attached = browser_launcher.ensure_running()
+    except Exception as exc:
+        logger.warning("Managed browser could not be started: %s", exc)
+        return None
+    with _managed_lock:
+        _MANAGED_CDP_URL = base
+        os.environ["BROWSER_CDP_URL"] = base
+        _MANAGED_LAST_ACTIVITY = time.time()
+        try:
+            _MANAGED_TAB_FINGERPRINT = browser_launcher.tab_fingerprint(base)
+        except Exception:
+            _MANAGED_TAB_FINGERPRINT = None
+        if attached:
+            _PENDING_RESUME_HINT.add(task_id)
+    return attached
+
+
+def _forget_managed_browser() -> None:
+    """Drop every trace of the managed endpoint once the browser is closed."""
+    global _MANAGED_CDP_URL, _MANAGED_TAB_FINGERPRINT
+    with _managed_lock:
+        _MANAGED_CDP_URL = None
+        _MANAGED_TAB_FINGERPRINT = None
+        _PENDING_RESUME_HINT.clear()
+        os.environ.pop("BROWSER_CDP_URL", None)
+
+
+def _maybe_close_idle_managed_browser() -> None:
+    """Close the managed browser after a long idle period - unless a human is
+    using the window.
+
+    The guard is the whole point.  This is the operator's own window, on his
+    own profile, and he drives it himself between agent tasks.  If the set of
+    open page URLs moved since our last tool call, somebody is using it, so the
+    net stands down and re-arms rather than closing a page being read.
+
+    ``browser.inactivity_timeout: 0`` disables the net entirely, which turns
+    the browser into "closes only on browser_close" without a code change.
+    """
+    global _MANAGED_LAST_ACTIVITY, _MANAGED_TAB_FINGERPRINT
+    timeout = BROWSER_SESSION_INACTIVITY_TIMEOUT
+    if not timeout or timeout <= 0:
+        return
+    with _managed_lock:
+        base = _MANAGED_CDP_URL
+        last = _MANAGED_LAST_ACTIVITY
+        known = _MANAGED_TAB_FINGERPRINT
+    if not base or not last or (time.time() - last) < timeout:
+        return
+    try:
+        from tools import browser_launcher
+        current = browser_launcher.tab_fingerprint(base)
+        if current is None:
+            _forget_managed_browser()  # browser already gone
+            return
+        if known is not None and current != known:
+            with _managed_lock:
+                _MANAGED_TAB_FINGERPRINT = current
+                _MANAGED_LAST_ACTIVITY = time.time()
+            logger.info(
+                "Managed browser idle for %ss but its tabs changed - a human is "
+                "using the window; leaving it open.", int(timeout),
+            )
+            return
+        logger.info("Closing managed browser after %ss of inactivity", int(timeout))
+        browser_launcher.close_browser()
+        _forget_managed_browser()
+    except Exception as exc:
+        logger.debug("Idle managed-browser check failed: %s", exc)
+
+
+def _browser_resume_hint(task_id: str) -> Optional[Dict[str, Any]]:
+    """Tab inventory handed to the agent on its first call after an attach.
+
+    Delivered in the tool RESULT rather than in the system prompt: it costs
+    nothing on the many turns that never touch a browser, and it lands in front
+    of the model at the moment it is actionable instead of tens of thousands of
+    tokens earlier.  Same mechanism as ``_blank_tab_recovery_hint`` (2026-07-19),
+    and safe from recursion for the same reason - the session already exists by
+    the time this runs.
+    """
+    try:
+        result = _run_browser_command(task_id, "tab", ["list"], timeout=8)
+        if not result.get("success"):
+            return None
+        tabs, _active_index = _normalize_tab_payload(result.get("data", {}))
+        if not tabs:
+            return None
+        return {
+            "reason": "attached_to_existing_browser",
+            "message": (
+                "The browser was already open - you did not start it. Review "
+                "the tabs below: close the ones irrelevant to the current task "
+                "with browser_tab(action='close', index=N), and use the "
+                "relevant ones instead of re-navigating. NEVER close a tab "
+                "marked \"protected\": that is the page the user was on."
+            ),
+            "tabs": [
+                {
+                    "index": tab["index"],
+                    "title": tab.get("title", ""),
+                    "url": tab.get("url", ""),
+                    "protected": bool(tab.get("active")),
+                }
+                for tab in tabs
+            ],
+        }
+    except Exception as exc:  # never let the hint break a tool call
+        logger.debug("Browser resume hint failed: %s", exc)
+        return None
+
+
 def _get_dialog_policy_config() -> Tuple[str, float]:
     """Read ``browser.dialog_policy`` + ``browser.dialog_timeout_s`` from config.
 
@@ -1743,6 +1947,10 @@ def _cleanup_inactive_browser_sessions():
         except Exception as e:
             logger.warning("Error cleaning up inactive session %s: %s", task_id, e)
 
+    # The managed browser outlives Hermes sessions by design, so it needs its
+    # own idle policy - closing a session no longer closes a window.
+    _maybe_close_idle_managed_browser()
+
 
 def _write_owner_pid(socket_dir: str, session_name: str) -> None:
     """Record the current hermes PID as the owner of a browser socket dir.
@@ -2393,6 +2601,16 @@ BROWSER_TOOL_SCHEMAS = [
             "required": ["action"]
         }
     },
+    {
+        "name": "browser_start",
+        "description": "Open the browser window without navigating anywhere. You almost never need this: every browser tool starts the browser automatically when it is not already running. Use it only to deliberately put a window on screen for the user.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "browser_close",
+        "description": "Close the browser window. Call this once you are done with the browser: the window stays open across tasks and even across Hermes restarts, so nothing else closes it for you. Do NOT call it while you still have pages to read, and do NOT call it right after an unresolved error \u2014 leaving the window open is what lets you or the user inspect what went wrong.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    },
 ]
 
 
@@ -2436,7 +2654,12 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
 def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     """Create a session that connects to a user-supplied CDP endpoint."""
     import uuid
-    session_name = f"cdp_{uuid.uuid4().hex[:10]}"
+    if _is_managed_cdp_url(cdp_url):
+        # One shared daemon for the managed browser, mirroring the fixed
+        # session name the persistent-profile local backend already uses.
+        session_name = _MANAGED_CDP_SESSION_NAME
+    else:
+        session_name = f"cdp_{uuid.uuid4().hex[:10]}"
     logger.info("Created CDP browser session %s → %s for task %s",
                 session_name, _sanitize_url_for_logs(cdp_url), task_id)
     return {
@@ -2505,6 +2728,14 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     # URLs in the same conversation continue to use the cloud session under
     # the bare task_id key.
     force_local = _is_local_sidecar_key(task_id)
+
+    # Managed local browser: make sure one exists, and that BROWSER_CDP_URL
+    # points at it, before the override below is resolved.  This is the single
+    # chokepoint every browser_* tool passes through, so the guarantee holds
+    # for all of them - including any tool a future upstream merge adds -
+    # without the model having to remember to open anything first.
+    if not force_local:
+        _ensure_managed_browser(task_id)
 
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override()
@@ -6398,6 +6629,133 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+def browser_start(task_id: Optional[str] = None) -> str:
+    """Open the browser window without navigating.
+
+    Rarely needed: ``_ensure_managed_browser`` already runs on the chokepoint
+    every browser tool passes through, so the window exists by the time any of
+    them acts.  This exists so the agent can deliberately put a window on
+    screen, and so the start/close pair reads symmetrically to the model.
+    """
+    effective_task_id = task_id or "default"
+    try:
+        attached = _ensure_managed_browser(effective_task_id)
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "error": f"Failed to start the browser: {exc}"},
+            ensure_ascii=False,
+        )
+    if attached is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "This install is not using the managed local browser "
+                    "(a cloud provider, Camofox, or an explicit CDP endpoint "
+                    "is configured); there is nothing to start."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "success": True,
+            "attached": attached,
+            "message": (
+                "Attached to the browser that was already open."
+                if attached
+                else "Browser started."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def browser_close(task_id: Optional[str] = None) -> str:
+    """Close the browser window for real, gracefully.
+
+    Nothing else closes it: the window is detached from every Hermes process
+    tree on purpose, so a task ending, a session ending, or the gateway dying
+    all leave it standing.  Closing goes through CDP ``Browser.close`` so the
+    profile records ``exit_type: "Normal"`` and the next launch shows no
+    "restore pages?" bubble.  A stubborn browser is escalated to SIGTERM and
+    never to SIGKILL - SIGKILL is what wrote ``"Crashed"`` in the first place.
+    """
+    effective_task_id = task_id or "default"
+    # Drop the Hermes-side session first so no daemon keeps talking to an
+    # endpoint that is about to disappear.
+    try:
+        cleanup_browser(effective_task_id)
+    except Exception as exc:
+        logger.debug("Session cleanup before browser close failed: %s", exc)
+    try:
+        from tools import browser_launcher
+        if not browser_launcher.is_running():
+            _forget_managed_browser()
+            return json.dumps(
+                {"success": True, "closed": False, "message": "No browser was open."},
+                ensure_ascii=False,
+            )
+        closed = browser_launcher.close_browser()
+    except Exception as exc:
+        return json.dumps(
+            {"success": False, "error": f"Failed to close the browser: {exc}"},
+            ensure_ascii=False,
+        )
+    _forget_managed_browser()
+    if closed:
+        return json.dumps(
+            {"success": True, "closed": True, "message": "Browser closed cleanly."},
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "success": False,
+            "closed": False,
+            "error": (
+                "The browser ignored both Browser.close and SIGTERM. It was "
+                "deliberately left running rather than SIGKILLed, which would "
+                "mark the profile as crashed."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _with_browser_resume_hint(handler):
+    """Attach the tab inventory to the first tool result after an attach.
+
+    Wrapping at the registry level rather than inside each tool means the hint
+    reaches the model whichever browser tool it happens to reach for first, and
+    that a tool added by a later upstream merge is covered without being
+    touched.  Strictly additive: on any failure the original result is returned
+    byte for byte.
+    """
+    @functools.wraps(handler)
+    def wrapped(args, **kw):
+        result = handler(args, **kw)
+        effective_task_id = kw.get("task_id") or "default"
+        with _managed_lock:
+            pending = effective_task_id in _PENDING_RESUME_HINT
+            if pending:
+                _PENDING_RESUME_HINT.discard(effective_task_id)
+        if not pending or not isinstance(result, str):
+            return result
+        hint = _browser_resume_hint(effective_task_id)
+        if hint is None:
+            return result
+        try:
+            payload = json.loads(result)
+        except (ValueError, TypeError):
+            return result
+        if not isinstance(payload, dict):
+            return result
+        payload["browser_resume"] = hint
+        return json.dumps(payload, ensure_ascii=False)
+
+    return wrapped
+
+
 from tools.registry import registry, tool_error
 
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
@@ -6602,3 +6960,39 @@ registry.register(
     check_fn=check_browser_requirements,
     emoji="🖱️",
 )
+
+registry.register(
+    name="browser_start",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_start"],
+    handler=lambda args, **kw: browser_start(task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="\U0001F680",
+)
+registry.register(
+    name="browser_close",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_close"],
+    handler=lambda args, **kw: browser_close(task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="\U0001F6D1",
+)
+
+# Wrap every browser tool so whichever one the agent reaches for first after
+# attaching to an already-open browser carries the tab inventory back with it.
+# browser_start reports the attach itself; browser_close is about to end the
+# session, so neither is wrapped.
+# ``get_entry`` is guarded because several test modules import browser_tool
+# against a stubbed ``tools`` package whose registry is a minimal fake. The
+# resume hint is a convenience, never a precondition for importing the module.
+_get_entry = getattr(registry, "get_entry", None)
+if callable(_get_entry):
+    for _resume_tool_name in _BROWSER_SCHEMA_MAP:
+        if _resume_tool_name in ("browser_start", "browser_close"):
+            continue
+        try:
+            _resume_entry = _get_entry(_resume_tool_name)
+        except Exception:
+            continue
+        if _resume_entry is not None and hasattr(_resume_entry, "handler"):
+            _resume_entry.handler = _with_browser_resume_hint(_resume_entry.handler)

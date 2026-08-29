@@ -41,10 +41,23 @@ class TestDeadCodeRemoval:
         import tools.browser_tool as bt
         assert not hasattr(bt, "DEFAULT_SESSION_TIMEOUT")
 
-    def test_browser_close_schema_removed(self):
+    def test_browser_close_schema_is_the_hermes_mods_lifecycle_tool(self):
+        """browser_close is back (hermes-mods, 2026-08-29), on purpose.
+
+        Upstream removed its browser_close as dead code. This install
+        deliberately reintroduces the name with real semantics: the browser is
+        detached from Hermes's lifetime (tools/browser_launcher.py), so nothing
+        closes the window implicitly any more and the agent needs a visible,
+        obviously-named tool to close it. Assert the wiring rather than the
+        absence.
+        """
         from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+        import tools.browser_tool as bt
         names = [s["name"] for s in BROWSER_TOOL_SCHEMAS]
-        assert "browser_close" not in names
+        assert "browser_close" in names
+        assert "browser_start" in names
+        assert callable(getattr(bt, "browser_close", None))
+        assert callable(getattr(bt, "browser_start", None))
 
 
 # ---------------------------------------------------------------------------

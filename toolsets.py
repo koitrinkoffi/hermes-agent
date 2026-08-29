@@ -71,6 +71,12 @@ _HERMES_CORE_TOOLS = [
     "browser_download", "browser_dropzone_upload",
     "browser_pdf",
     "browser_tab", "browser_upload",
+    # browser_close is pinned core (2026-08-29) while browser_start stays
+    # deferred. The browser is now detached from Hermes's lifetime: nothing
+    # closes the window but this tool, so the reflex has to be visible in the
+    # schema. browser_start is redundant by construction -- every browser tool
+    # opens the window on its own -- so it costs nothing to leave deferred.
+    "browser_close",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
