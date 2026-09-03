@@ -357,7 +357,7 @@ class TestModelPrecedence:
         calls = self._run(
             delegate_harness,
             _FakeParent(),
-            tasks=[{"goal": "a"}, {"goal": "b"}],
+            tasks=[{"goal": "task alpha"}, {"goal": "task bravo"}],
             model="Small-4B",
         )
 
@@ -367,7 +367,10 @@ class TestModelPrecedence:
         calls = self._run(
             delegate_harness,
             _FakeParent(),
-            tasks=[{"goal": "a", "model": "Big-35B"}, {"goal": "b"}],
+            tasks=[
+                {"goal": "task alpha", "model": "Big-35B"},
+                {"goal": "task bravo"},
+            ],
             model="Small-4B",
         )
 
@@ -402,9 +405,9 @@ class TestModelPrecedence:
             delegate_harness,
             _FakeParent(),
             tasks=[
-                {"goal": "a", "model": "Small-4B"},
-                {"goal": "b", "model": "Small-4B"},
-                {"goal": "c", "model": "Small-4B"},
+                {"goal": "task alpha", "model": "Small-4B"},
+                {"goal": "task bravo", "model": "Small-4B"},
+                {"goal": "task charlie", "model": "Small-4B"},
             ],
         )
 
