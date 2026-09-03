@@ -112,6 +112,12 @@ _HERMES_CORE_TOOLS = [
     # stay deferred and reachable via tool_search.
     "himalaya_envelope_list", "himalaya_envelope_search",
     "himalaya_message_read", "himalaya_message_compose",
+    # Local image/music generation (comfyui plugin) — pinned for the same
+    # reason: the built-in image_gen/video_gen toolsets are disabled and the
+    # old creative/comfyui SKILL was retired when this plugin replaced it, so
+    # nothing else signals the agent can generate at all. One self-describing
+    # entry tool; deferred would leave it fumbling or claiming "I can't".
+    "comfyui_generate",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
