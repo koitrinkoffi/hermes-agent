@@ -2895,8 +2895,8 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
     try:
         with os.scandir(target) as scan:
-            entries = [
-                _managed_file_entry(policy, Path(entry.path))
+            children = [
+                Path(entry.path)
                 for entry in scan
                 if not _is_sensitive_path(Path(entry.path))
             ]
