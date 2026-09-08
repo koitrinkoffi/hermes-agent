@@ -7398,6 +7398,131 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+# --------------------------------------------------------------------------
+# LOCAL MOD (hermes-mods): single-GPU admission control for cron runs.
+# See cron/gpu_arbiter.py for the full rationale. Signature: gpu_arbiter.
+# --------------------------------------------------------------------------
+
+_GPU_DEFER_RETRY_SECONDS = 60.0  # one ticker tick
+
+
+def _gpu_arbiter_module():
+    """Import the arbiter, or None. Never let a mod break the fleet."""
+    try:
+        from cron import gpu_arbiter
+
+        return gpu_arbiter
+    except Exception:
+        logger.debug("gpu_arbiter unavailable; cron runs unarbitrated", exc_info=True)
+        return None
+
+
+def _gpu_execution_is_tick_fired(execution_id: str) -> bool:
+    """True when this fire came from the ticker rather than a manual run.
+
+    The distinction decides the deferral shape, and it is a property of the
+    INVOCATION, not of the job -- which is why no per-job list is needed and
+    every future cron inherits the right behaviour for free:
+
+      * ticker ("builtin"/provider) -> next_run_at was already advanced by
+        advance_next_runs(), so standing down must ALSO re-arm or the
+        occurrence is lost.
+      * manual ("direct", e.g. the Popen in mailflow_watch.py) -> there is a
+        live caller that re-drives on its own next tick, so refusing is
+        enough and re-arming would fight the caller's own schedule.
+    """
+    try:
+        from cron.executions import get_execution
+
+        execution = get_execution(execution_id) or {}
+        return str(execution.get("source") or "").strip().lower() != "direct"
+    except Exception:
+        # Unknown provenance: re-arm. Losing an occurrence is worse than an
+        # extra retry a minute later.
+        return True
+
+
+def _gpu_stamp_deferral_note(job: dict) -> None:
+    """End this job's deferral episode now that it is actually running.
+
+    The cumulative wait is stashed on the job dict so the normal delivery can
+    mention it. Surfacing it where the user already looks (their Telegram
+    topic) means a working arbiter is invisible and a struggling one is not.
+    """
+    gpu = _gpu_arbiter_module()
+    if gpu is None:
+        return
+    try:
+        summary = gpu.clear_deferrals(str(job.get("id")))
+    except Exception:
+        logger.debug("gpu_arbiter: could not clear deferral episode", exc_info=True)
+        return
+    if summary:
+        count, waited = summary
+        job["_gpu_deferral_note"] = gpu.format_deferral_note(count, waited)
+
+
+def _gpu_defer_job(job: dict, execution_id: str, reason: str, adapters=None, loop=None) -> None:
+    """Record a deferral, re-arm when appropriate, and alert on starvation."""
+    gpu = _gpu_arbiter_module()
+    if gpu is None:
+        return
+    name = job.get("name", job.get("id", "?"))
+    try:
+        count, waited, should_alert = gpu.record_deferral(job, reason)
+    except Exception:
+        logger.debug("gpu_arbiter: deferral bookkeeping failed", exc_info=True)
+        count, waited, should_alert = 0, 0.0, False
+
+    logger.info(
+        "Job '%s': GPU arbiter deferred this run (%s); deferral #%s",
+        name,
+        reason,
+        count,
+    )
+
+    # Always release the fire claim; only a tick-fired occurrence needs
+    # re-arming (a manual caller re-drives on its own schedule).
+    try:
+        from cron.jobs import defer_job_for_gpu
+
+        defer_job_for_gpu(
+            job["id"],
+            _GPU_DEFER_RETRY_SECONDS,
+            rearm=_gpu_execution_is_tick_fired(execution_id),
+        )
+    except Exception:
+        logger.warning(
+            "Job '%s': GPU deferral could not update the job record", name, exc_info=True
+        )
+
+    if should_alert:
+        # The one notice that does NOT ride a successful run. A wedged gate
+        # produces perfect silence otherwise: refused processors deliver
+        # nothing and quiet watcher ticks print nothing.
+        try:
+            _deliver_result(
+                job,
+                gpu.format_starvation_alert(job, count, waited, reason),
+                adapters,
+                loop,
+                for_failure=True,
+            )
+        except Exception:
+            logger.error(
+                "Job '%s': GPU starvation alert could not be delivered", name, exc_info=True
+            )
+
+    try:
+        finish_execution(
+            execution_id,
+            success=False,
+            error=f"Deferred by the GPU arbiter: {reason}",
+        )
+    except Exception:
+        logger.debug("gpu_arbiter: finish_execution failed", exc_info=True)
+
+
 def run_one_job(
     job: dict,
     *,
@@ -7434,6 +7559,18 @@ def run_one_job(
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
+
+    # LOCAL MOD (hermes-mods): cheap pre-check so a job that is going to be
+    # deferred does not first pay for a detached worker process. The
+    # authoritative check is the lease acquisition further down -- this one
+    # only avoids waste, so a race here is harmless.
+    _gpu = _gpu_arbiter_module()
+    if _gpu is not None:
+        _gate = _gpu.cron_gate(job)
+        if not _gate.allowed:
+            _gpu_defer_job(job, execution_id, _gate.reason, adapters, loop)
+            return True
+
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
@@ -7473,22 +7610,54 @@ def run_one_job(
             profile_home,
         )
     try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
+        # LOCAL MOD (hermes-mods): hold the global GPU lease for the whole
+        # run. Taken HERE (not in _run_one_job_body) so the process that
+        # actually executes owns it -- with a detached worker that is the
+        # child, not the parent that spawned it. Subagents delegated inside
+        # the run inherit this lease and must never take it again (the
+        # arbiter's reentrancy guard is PID-based).
+        #
+        # An ExitStack rather than a second copy of the call below: the run
+        # invocation stays a single expression, so an upstream change to its
+        # arguments is one merge hunk instead of two that can drift apart.
+        with contextlib.ExitStack() as _gpu_stack:
+            if _gpu is not None and _gpu.is_enabled() and not job.get("no_agent"):
+                _held = _gpu_stack.enter_context(
+                    _gpu.hold_global_lease(str(job.get("name") or job.get("id")))
+                )
+                # An `always` job is never held back -- but it still takes the
+                # lease when it happens to be free, so that everything else
+                # sees it and waits its turn. Only the DEFER direction is
+                # waived, not the announcement. Checking the policy here as
+                # well as in cron_gate is not redundant: this is a second,
+                # independent refusal point, and an earlier version honoured
+                # `always` at the gate and then deferred the job here anyway.
+                if not _held and _gpu.resolve_job_gpu_policy(job) != "always":
+                    _gpu_defer_job(
+                        job,
+                        execution_id,
+                        "the GPU is in use by another run",
+                        adapters,
+                        loop,
+                    )
+                    return True
+                _gpu_stamp_deferral_note(job)
+            return _run_with_fire_claim_heartbeat(
                 job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token,
                 ),
-                execution_token=execution_token,
-            ),
-        )
+            )
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])
@@ -7809,6 +7978,17 @@ def _run_one_job_body(
                     "Job '%s': skipping delivery after fire claim ownership loss",
                     job["id"],
                 )
+
+            # LOCAL MOD (hermes-mods): if the GPU arbiter held this run back,
+            # say so on the delivery it finally makes. Costs nothing on a run
+            # that never waited (no stamp, no note).
+            _gpu_note = job.pop("_gpu_deferral_note", None)
+            if (
+                _gpu_note
+                and isinstance(deliver_content, str)
+                and deliver_content.strip()
+            ):
+                deliver_content = f"{deliver_content}\n\n{_gpu_note}"
 
             if should_deliver:
                 unresolved_origin = (

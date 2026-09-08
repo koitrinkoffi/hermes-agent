@@ -2247,6 +2247,72 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_gpu_policy(value: Any) -> Optional[str]:
+    """Validate a per-job GPU arbitration policy (LOCAL MOD, hermes-mods).
+
+    Thin delegation to ``cron.gpu_arbiter.normalize_gpu_policy`` so the
+    grammar has exactly one definition. Kept as a wrapper here (rather than
+    importing the arbiter at module scope) because ``cron.jobs`` is imported
+    on paths where the arbiter is irrelevant, and a hard dependency would
+    turn any arbiter import error into a cron-store import error.
+
+    Returns None for unset (None/empty), the canonical lowercase value
+    otherwise, and raises ValueError on anything else.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    from cron.gpu_arbiter import normalize_gpu_policy
+
+    return normalize_gpu_policy(value)
+
+
+def defer_job_for_gpu(job_id: str, delay_seconds: float, *, rearm: bool = True) -> bool:
+    """Stand a tick-fired job down and re-arm it (LOCAL MOD, hermes-mods).
+
+    WHY THIS IS NEEDED AND NOT JUST "SKIP THE DISPATCH": ``tick`` calls
+    ``advance_next_runs()`` over the WHOLE due set BEFORE dispatching any of
+    them, so by the time the GPU gate runs the job's ``next_run_at`` has
+    already jumped to its next natural occurrence. Simply not running it
+    would not postpone the run, it would DROP it -- a daily 07:30 job would
+    silently skip the day.
+
+    Clearing ``fire_claim`` matters just as much: the claim was taken to fire
+    this occurrence, and leaving it behind would make the re-armed occurrence
+    look like it was already being fired.
+
+    ``rearm=False`` is the manual-run case (``hermes cron run``, e.g. the
+    Popen in mailflow_watch.py): the caller re-drives on its own schedule, so
+    moving ``next_run_at`` would fight it. The fire claim is cleared on BOTH
+    paths regardless -- it was taken to fire an occurrence that is not going
+    to happen, and leaving it behind makes the next fire look like a
+    double-fire until the claim heartbeat grace expires.
+
+    Returns True when the job record was found and updated.
+    """
+    import time as _time
+
+    from datetime import timedelta
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if rearm:
+                retry_at = _hermes_now() + timedelta(
+                    seconds=max(1.0, float(delay_seconds))
+                )
+                job["next_run_at"] = retry_at.isoformat()
+            job["fire_claim"] = None
+            job["gpu_deferred_at"] = _time.time()
+            jobs[i] = job
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -2351,6 +2417,12 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
+    # LOCAL MOD (hermes-mods): per-job GPU arbitration policy. This install
+    # serves every model from one lemonade instance on a single GPU, so cron
+    # runs and interactive turns must take turns -- see cron/gpu_arbiter.py.
+    # User-owned like model/reasoning_effort: deliberately absent from the
+    # cronjob tool SCHEMA so an agent cannot grant its own job priority.
+    gpu_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2453,6 +2525,10 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    # LOCAL MOD (hermes-mods): validate at the storage choke point, exactly
+    # like reasoning_effort -- an invalid value must never reach a
+    # fire-and-forget job where the gate would have to guess at read time.
+    normalized_gpu_policy = _normalize_gpu_policy(gpu_policy)
     # failure_deliver shares deliver's value grammar; the str/list
     # flatten below mirrors the tool layer's _normalize_deliver_param for
     # direct create_job callers (the tool pre-normalizes). Semantic
@@ -2584,6 +2660,11 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # LOCAL MOD (hermes-mods): same conditional-persist rule -- an absent key
+    # means the job follows cron.gpu_policy, so untouched jobs stay
+    # byte-identical to upstream records.
+    if normalized_gpu_policy is not None:
+        job["gpu_policy"] = normalized_gpu_policy
     # Conditional-persist for failure_deliver too: absent key = failures
     # follow deliver, byte-identical to pre-feature jobs (NS-788).
     if normalized_failure_deliver is not None:
@@ -2701,6 +2782,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             if "reasoning_effort" in updates:
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
+                )
+
+            # LOCAL MOD (hermes-mods): same contract for the GPU policy pin --
+            # canonical values only, empty string clears, invalid raises
+            # BEFORE the merge so the stored value survives a bad edit.
+            if "gpu_policy" in updates:
+                updates["gpu_policy"] = _normalize_gpu_policy(
+                    updates["gpu_policy"]
                 )
 
             # Normalize repeat the same way create_job does. Callers pass

@@ -9395,6 +9395,11 @@ class AIAgent:
                 with redirect_lock:
                     _clear_if_owned()
 
+        # LOCAL MOD (hermes-mods): GPU arbitration holder for this turn.
+        # Bound OUTSIDE the try below, because that try's finally releases it
+        # and several paths (lease timeout, lease-wait interrupt, task-start
+        # failure) leave the try before the acquisition site is reached.
+        _gpu_turn_lease_holder = None
         try:
             _review_queue.note_turn_started()
             # Serialize the full load -> run -> flush region across Hermes
@@ -9812,6 +9817,52 @@ class AIAgent:
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
                 try:
+                    # LOCAL MOD (hermes-mods): take the single-GPU lease for
+                    # this turn so a cron run cannot generate underneath it.
+                    # See cron/gpu_arbiter.py.
+                    #
+                    # ORDER: this is taken AFTER the session turn lease, not
+                    # before. Only this one call path ever takes both leases
+                    # (cron runs take the global one alone), so no lock cycle
+                    # is possible either way; taking it here — inside the try
+                    # whose finally releases it — is what makes the early
+                    # returns of the session-lease block above unable to leak
+                    # a global lease that nothing would then release.
+                    #
+                    # It NEVER blocks the turn: a user Ctrl+C or the wait cap
+                    # proceeds without the lease. Discarding the user's
+                    # message over a performance courtesy would be the wrong
+                    # trade — that is the session lease's job, not this one's.
+                    try:
+                        from cron.gpu_arbiter import acquire_interactive
+
+                        _gpu_outcome, _gpu_turn_lease_holder = acquire_interactive(
+                            str(task_context.get("platform") or "turn"),
+                            on_wait=lambda elapsed, blocker: self._emit_status(
+                                f"⏳ Waiting for the GPU — {blocker} is running "
+                                f"({int(elapsed)}s). Ctrl+C to start anyway."
+                            ),
+                            should_abort=lambda: getattr(
+                                self, "_interrupt_requested", False
+                            ),
+                            # Lend the turn's own SessionDB rather than making
+                            # the arbiter borrow one from the registry: in a
+                            # process holding no other reference that would
+                            # build and tear down a whole SessionDB per turn.
+                            db=_turn_db,
+                        )
+                        if _gpu_outcome == "override":
+                            self._emit_status(
+                                "Starting now; a background run is still using "
+                                "the GPU, so this turn may be slower."
+                            )
+                    except Exception:
+                        logger.debug(
+                            "gpu_arbiter: interactive acquisition skipped",
+                            exc_info=True,
+                        )
+                        _gpu_turn_lease_holder = None
+
                     if durable_turn_lease_refresh is not None:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True
@@ -9903,6 +9954,22 @@ class AIAgent:
                             relay_lease
                         )
                 finally:
+                    # LOCAL MOD (hermes-mods): release the GPU lease first so
+                    # a queued cron job can start the moment this turn ends,
+                    # rather than after the transcript flush below.
+                    if _gpu_turn_lease_holder:
+                        try:
+                            from cron.gpu_arbiter import release_interactive
+
+                            release_interactive(
+                                _gpu_turn_lease_holder, db=_turn_db
+                            )
+                        except Exception:
+                            logger.error(
+                                "Failed to release the GPU arbiter lease",
+                                exc_info=True,
+                            )
+                        _gpu_turn_lease_holder = None
                     _stop_durable_turn_lease_refresher()
                     # wait=1.0 mirrors the old thread join(timeout=1.0): an
                     # in-flight tick on the scheduler thread finishes first.

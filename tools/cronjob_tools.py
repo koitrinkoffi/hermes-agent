@@ -1533,6 +1533,12 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    # LOCAL MOD (hermes-mods): GPU arbitration policy. Same CLI-only lane as
+    # model/reasoning_effort -- present on the FUNCTION so `hermes cron
+    # create/edit --gpu-policy` can reach create_job/update_job, absent from
+    # CRONJOB_SCHEMA so a model cannot hand its own job priority over the
+    # user's interactive session.
+    gpu_policy: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1655,6 +1661,8 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    # LOCAL MOD (hermes-mods): CLI-only, same rule as above.
+                    gpu_policy=gpu_policy,
                     failure_deliver=_resolve_cron_context_deliver(
                         _normalize_deliver_param(failure_deliver)
                     ),
@@ -1887,6 +1895,10 @@ def cronjob(
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.
                 updates["reasoning_effort"] = reasoning_effort
+            # LOCAL MOD (hermes-mods): same CLI-only lane for the GPU policy;
+            # update_job validates, empty string clears the pin.
+            if gpu_policy is not None:
+                updates["gpu_policy"] = gpu_policy
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may

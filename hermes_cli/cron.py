@@ -240,6 +240,24 @@ def cron_list(show_all: bool = False):
         print(f"    Schedule:  {schedule}")
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
+        # LOCAL MOD (hermes-mods): surface an in-progress GPU deferral episode.
+        # A deferred job is otherwise completely silent -- it delivers nothing
+        # and its last_status still shows the previous successful run -- so
+        # without this line there is no way to see the arbiter holding it back.
+        try:
+            from cron.gpu_arbiter import deferral_summary
+
+            _defer = deferral_summary(job_id)
+        except Exception:
+            _defer = None
+        if _defer:
+            _dc, _dw = _defer
+            print(
+                color(
+                    f"    Deferred:  {_dc}x, waiting {int(_dw // 60)}m for the GPU",
+                    Colors.YELLOW,
+                )
+            )
         print(f"    Deliver:   {deliver_str}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
@@ -283,8 +301,15 @@ def cron_list(show_all: bool = False):
 
         latest_execution = job.get("latest_execution")
         if latest_execution:
+            # LOCAL MOD (hermes-mods): a GPU deferral finishes its execution
+            # row as failed (there is no "deferred" terminal state upstream),
+            # which reads as a broken job. Name what actually happened.
+            _exec_err = str(latest_execution.get("error") or "")
+            _exec_status = latest_execution.get("status", "?")
+            if _exec_err.startswith("Deferred by the GPU arbiter"):
+                _exec_status = "deferred (GPU busy)"
             print(
-                f"    Execution: {latest_execution.get('status', '?')}  "
+                f"    Execution: {_exec_status}  "
                 f"{latest_execution.get('id', '?')}"
             )
 
@@ -804,6 +829,9 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        # LOCAL MOD (hermes-mods): GPU arbitration policy, CLI-only lane
+        # (absent from CRONJOB_SCHEMA). See cron/gpu_arbiter.py.
+        gpu_policy=getattr(args, "gpu_policy", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -880,6 +908,9 @@ def cron_edit(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        # LOCAL MOD (hermes-mods): GPU arbitration policy, CLI-only lane
+        # (absent from CRONJOB_SCHEMA). See cron/gpu_arbiter.py.
+        gpu_policy=getattr(args, "gpu_policy", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -959,8 +990,16 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             else:
                 print("  Running in background.")
         elif job.get("executed"):
-            outcome = "succeeded" if job.get("execution_success") else "failed"
-            print(f"  Ran now: {outcome}.")
+            # LOCAL MOD (hermes-mods): a GPU-arbiter deferral is neither a
+            # success nor a failure -- the job never ran. Reporting "failed"
+            # sent people hunting for a bug that was the arbiter working.
+            _exec_error = str(job.get("execution_error") or "")
+            if _exec_error.startswith("Deferred by the GPU arbiter"):
+                print(f"  Not run: {_exec_error[len('Deferred by the '):]}.")
+                print("  It will be retried once the GPU is free.")
+            else:
+                outcome = "succeeded" if job.get("execution_success") else "failed"
+                print(f"  Ran now: {outcome}.")
         elif job.get("execution_skipped"):
             print(f"  {job['execution_skipped']}")
         else:

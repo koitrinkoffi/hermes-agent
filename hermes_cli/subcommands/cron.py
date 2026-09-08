@@ -129,6 +129,19 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "clamped by the provider at request time. Omit to follow config."
         ),
     )
+    # LOCAL MOD (hermes-mods): see cron/gpu_arbiter.py for why this install
+    # needs a per-job GPU policy at all.
+    cron_create.add_argument(
+        "--gpu-policy",
+        dest="gpu_policy",
+        choices=["defer", "always"],
+        help=(
+            "How this job shares the single local GPU: 'defer' (default) waits "
+            "for the interactive session to go quiet; 'always' ignores the "
+            "arbiter, for a job whose timing matters more than your session. "
+            "Omit to follow cron.gpu_policy."
+        ),
+    )
     cron_create.add_argument(
         "--continuity",
         dest="continuity",
@@ -270,6 +283,17 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution."
+        ),
+    )
+    # LOCAL MOD (hermes-mods): see cron/gpu_arbiter.py.
+    cron_edit.add_argument(
+        "--gpu-policy",
+        dest="gpu_policy",
+        choices=["defer", "always", ""],
+        help=(
+            "How this job shares the single local GPU: 'defer' waits for the "
+            "interactive session to go quiet, 'always' ignores the arbiter. "
+            "Pass empty string to clear the pin and follow cron.gpu_policy."
         ),
     )
 
