@@ -209,6 +209,22 @@ _INPUT_TOOLS = frozenset({
     "browser_drag", "browser_scroll", "browser_upload", "browser_dropzone_upload",
     "browser_download", "browser_mouse_wheel",
 })
+# Tools whose arguments carry snapshot refs: switching tab clears agent-browser's
+# ref map, so after a bring-to-front the refs are rebuilt with a silent snapshot.
+_REF_TOOLS = frozenset({
+    "browser_click", "browser_type", "browser_mouse", "browser_drag", "browser_upload",
+    "browser_download", "browser_frame", "browser_read",
+})
+_OBSERVE_FIRST_TOOLS = _INPUT_TOOLS | {"browser_snapshot", "browser_read", "browser_vision"}
+
+
+def active_tab_hidden(task_id: Optional[str]) -> bool:
+    """True when the tab agent-browser acts on is not the one shown in the window."""
+    try:
+        out = json.loads(bt._browser_eval("document.visibilityState", task_id, timeout=3))
+    except Exception:
+        return False
+    return bool(out.get("success")) and out.get("result") == "hidden"
 
 
 def bring_active_tab_to_front(task_id: Optional[str]) -> bool:
@@ -226,6 +242,23 @@ def bring_active_tab_to_front(task_id: Optional[str]) -> bool:
     if ok:
         _FRONTED.add(tid)
     return ok
+
+
+def _front_preflight(name: str, args: Dict[str, Any], task_id: Optional[str]) -> None:
+    tid = bt._last_session_key(task_id or "default")
+    if name == "browser_navigate":
+        # The navigation replaces the page and its refs anyway: always safe.
+        bring_active_tab_to_front(task_id)
+        return
+    if name not in _OBSERVE_FIRST_TOOLS:
+        return
+    if tid in _FRONTED and not active_tab_hidden(task_id):
+        return
+    if tid not in _FRONTED and not active_tab_hidden(task_id):
+        _FRONTED.add(tid)
+        return
+    if bring_active_tab_to_front(task_id) and name in _REF_TOOLS and name != "browser_snapshot":
+        bt._run_browser_command(tid, "snapshot", snapshot_flags(baseline=True), timeout=20)
 
 
 # ── progress guard (stop rule) ────────────────────────────────────────────────
@@ -310,23 +343,24 @@ _FRAME_RESET_TOOLS = frozenset({"browser_navigate", "browser_back", "browser_tab
 def _wrap_handler(name: str, handler: Callable) -> Callable:
     def wrapped(args, **kw):
         task_id = kw.get("task_id")
-        if name in _INPUT_TOOLS:
-            try:
-                if bt._last_session_key(task_id or "default") not in _FRONTED:
-                    bring_active_tab_to_front(task_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("bring-to-front preflight failed: %s", exc)
+        try:
+            _front_preflight(name, args if isinstance(args, dict) else {}, task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("bring-to-front preflight failed: %s", exc)
         result = handler(args, **kw)
         if not isinstance(result, str):
             return result
+        # agent-browser's own errors name its CLI verbs; point at the Hermes tool.
+        if "`dialog accept` or `dialog dismiss`" in result:
+            result = result.replace(
+                "`dialog accept` or `dialog dismiss`",
+                "browser_dialog(action='accept', prompt_text=...) or browser_dialog(action='dismiss')")
         try:
-            if name == "browser_navigate" and not _result_failed(result):
-                bring_active_tab_to_front(task_id)
-            elif name == "browser_tab" and not _result_failed(result):
+            if name == "browser_tab" and not _result_failed(result):
                 _FRONTED.add(bt._last_session_key(task_id or "default"))
             if name in _FRAME_RESET_TOOLS:
                 _clear_frame(task_id)
-            if name in _OBSERVE_TOOLS and not _result_failed(result):
+            if name in _OBSERVE_TOOLS and not _result_failed(result) and '"dialog_opened": true' not in result:
                 obs = observe_after_action(task_id)
                 if obs is not None:
                     data = json.loads(result)
@@ -340,7 +374,8 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
             logger.debug("browser post-processing failed for %s: %s", name, exc)
         return result
 
-    wrapped.__wrapped__ = handler  # type: ignore[attr-defined]
+    wrapped._hermes_browser_wrapped = True  # type: ignore[attr-defined]
+    wrapped._hermes_inner = handler  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -417,6 +452,10 @@ def browser_find(by: str, value: str, action: str = "click", text: Optional[str]
         return _json({"success": False, "error": res.get("error", f"No element found by {by}={value!r}")})
     data = res.get("data", {}) or {}
     out: Dict[str, Any] = {"success": True, "found_by": f"{by}={value}", "action": action}
+    if isinstance(data, dict) and data.get("dialogOpened"):
+        out["dialog_opened"] = True
+        out["next"] = ("A JavaScript dialog is now open and blocks the page: answer it with "
+                       "browser_dialog(action='accept', prompt_text=...) or browser_dialog(action='dismiss').")
     if action == "text":
         val = data.get("text") if isinstance(data, dict) else data
         out["text"] = bt._redact_browser_output(val)
@@ -620,7 +659,9 @@ def _install_wrappers() -> None:
         if not name.startswith("browser_"):
             continue
         entry = registry.get_entry(name)
-        if entry is None or getattr(entry.handler, "__wrapped__", None) is not None or entry.is_async:
+        # Other layers (the registry itself) already set __wrapped__ through
+        # functools.wraps, so mark our own wrapper explicitly.
+        if entry is None or getattr(entry.handler, "_hermes_browser_wrapped", False) or entry.is_async:
             continue
         entry.handler = _wrap_handler(name, entry.handler)
 

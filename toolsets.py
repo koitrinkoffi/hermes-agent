@@ -76,6 +76,10 @@ _HERMES_CORE_TOOLS = [
     # (42% of evals were iframe hacks, 13% whole-page innerText dumps), so
     # they must be in front of the model, not behind tool_search.
     "browser_read", "browser_find", "browser_wait", "browser_frame",
+    # browser_dialog back to core: a page blocked by a JS dialog must be
+    # answerable at once; deferred, the model rewrote window.prompt instead
+    # (baseline s06, 2026-09-29).
+    "browser_dialog",
     # browser_close is pinned core (2026-08-29) while browser_start stays
     # deferred. The browser is now detached from Hermes's lifetime: nothing
     # closes the window but this tool, so the reflex has to be visible in the

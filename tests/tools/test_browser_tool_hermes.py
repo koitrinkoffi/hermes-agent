@@ -11,7 +11,7 @@ import tools.browser_tool_hermes as bh
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
-    monkeypatch.setattr(bh, "bring_active_tab_to_front", lambda task_id: True)
+    monkeypatch.setattr(bh, "_front_preflight", lambda name, args, task_id: None)
     monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
     monkeypatch.setattr(bt, "_last_session_key", lambda task_id: f"session::{task_id}")
     bh._PROGRESS.clear()

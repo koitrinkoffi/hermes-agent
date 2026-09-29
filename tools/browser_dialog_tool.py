@@ -79,42 +79,65 @@ BROWSER_DIALOG_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _agent_browser_dialog(action: str, prompt_text: Optional[str], task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Answer the dialog through agent-browser (``dialog accept [text]`` / ``dialog dismiss``).
+
+    hermes-mods: the CDP supervisor listens on ONE tab (the first one it
+    attached to), so a dialog opened in any other tab is invisible to it,
+    while agent-browser sees dialogs on the tab it acts on.
+    """
+    try:
+        from tools import browser_tool as bt
+    except Exception:
+        return None
+    verb = "accept" if action == "accept" else "dismiss"
+    args = [verb] + ([prompt_text] if verb == "accept" and prompt_text is not None else [])
+    res = bt._run_browser_command(bt._last_session_key(task_id or "default"), "dialog", args, timeout=15)
+    if res.get("success"):
+        data = dict(res.get("data") or {})
+        data.pop("lifecycle", None)
+        return {"success": True, "action": verb, "via": "agent-browser", "dialog": data}
+    return {"success": False, "error": res.get("error", "dialog command failed")}
+
+
 def browser_dialog(
     action: str,
     prompt_text: Optional[str] = None,
     dialog_id: Optional[str] = None,
     task_id: Optional[str] = None,
 ) -> str:
-    """Respond to a pending dialog on the active task's CDP supervisor."""
+    """Respond to a pending dialog (CDP supervisor first, agent-browser otherwise)."""
     effective_task_id = task_id or "default"
     supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
     if supervisor is None:
-        return json.dumps(
-            {
-                "success": False,
-                "error": (
-                    "No CDP supervisor is attached to this task. Either the "
-                    "browser backend doesn't expose CDP (Camofox, default "
-                    "Playwright) or no browser session has been started yet. "
-                    "Call browser_navigate or /browser connect first."
-                ),
-            }
+        try:
+            from tools import browser_tool as bt
+            supervisor = SUPERVISOR_REGISTRY.get(bt._last_session_key(effective_task_id))
+        except Exception:
+            supervisor = None
+    sup_error = None
+    if supervisor is not None:
+        result = supervisor.respond_to_dialog(
+            action=action,
+            prompt_text=prompt_text,
+            dialog_id=dialog_id,
         )
-
-    result = supervisor.respond_to_dialog(
-        action=action,
-        prompt_text=prompt_text,
-        dialog_id=dialog_id,
+        if result.get("ok"):
+            return json.dumps(
+                {
+                    "success": True,
+                    "action": action,
+                    "dialog": result.get("dialog", {}),
+                }
+            )
+        sup_error = result.get("error", "unknown error")
+    fallback = _agent_browser_dialog(action, prompt_text, task_id)
+    if fallback is not None and fallback.get("success"):
+        return json.dumps(fallback, ensure_ascii=False)
+    error = (fallback or {}).get("error") or sup_error or (
+        "No dialog is open and no browser session exists yet. Call browser_navigate first."
     )
-    if result.get("ok"):
-        return json.dumps(
-            {
-                "success": True,
-                "action": action,
-                "dialog": result.get("dialog", {}),
-            }
-        )
-    return json.dumps({"success": False, "error": result.get("error", "unknown error")})
+    return json.dumps({"success": False, "error": error}, ensure_ascii=False)
 
 
 def _browser_dialog_check() -> bool:
@@ -133,6 +156,16 @@ def _browser_dialog_check() -> bool:
     return _browser_cdp_check()
 
 
+def _browser_dialog_check_or_browser() -> bool:
+    if _browser_dialog_check():
+        return True
+    try:
+        from tools.browser_tool import check_browser_requirements
+        return bool(check_browser_requirements())
+    except Exception:
+        return False
+
+
 registry.register(
     name="browser_dialog",
     toolset="browser-cdp",
@@ -143,6 +176,8 @@ registry.register(
         dialog_id=args.get("dialog_id"),
         task_id=kw.get("task_id"),
     ),
-    check_fn=_browser_dialog_check,
+    # hermes-mods: offered whenever the browser tools are - the agent-browser
+    # fallback answers dialogs without a reachable CDP endpoint at schema time.
+    check_fn=_browser_dialog_check_or_browser,
     emoji="💬",
 )

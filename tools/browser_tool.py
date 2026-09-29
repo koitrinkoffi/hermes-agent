@@ -3899,6 +3899,19 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             )
         return _cached_agent_browser
 
+    # hermes-mods: explicit override for a locally built agent-browser (the
+    # hermes fork: tab index alias, --prune, --frame-depth, frame-aware eval,
+    # inline-PDF downloads). PATH cannot be used for this: the gateway puts
+    # node_modules/.bin ahead of ~/.local/bin.
+    _override = os.environ.get("HERMES_AGENT_BROWSER_BIN", "").strip()
+    if _override:
+        _override = os.path.expanduser(_override)
+        if os.path.isfile(_override) and os.access(_override, os.X_OK):
+            _cached_agent_browser = _override
+            _agent_browser_resolved = True
+            return _override
+        logger.warning("HERMES_AGENT_BROWSER_BIN=%s is not an executable file; ignoring it", _override)
+
     # Note: _agent_browser_resolved is set at each return site below
     # (not before the search) to prevent a race where a concurrent thread
     # sees resolved=True but _cached_agent_browser is still None.
@@ -5312,6 +5325,14 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
             "success": True,
             "clicked": ref
         }
+        _data = result.get("data") or {}
+        if isinstance(_data, dict) and _data.get("dialogOpened"):
+            response["dialog_opened"] = True
+            response["next"] = ("A JavaScript dialog (alert/confirm/prompt) is now open and blocks the page: "
+                                "answer it with browser_dialog(action='accept', prompt_text=...) or "
+                                "browser_dialog(action='dismiss').")
+        if isinstance(_data, dict) and _data.get("newTab"):
+            response["new_tab"] = True
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
     else:
         response = {
