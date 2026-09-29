@@ -193,6 +193,41 @@ def observe_after_action(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     return obs
 
 
+# ── keep the acted-on tab visible ─────────────────────────────────────────────
+#
+# When agent-browser attaches over CDP to an already-open browser it takes the
+# FIRST tab as its active tab without bringing it to front, while the window
+# shows another (restored) tab. Chromium ignores synthetic input sent to a
+# hidden tab: clicks "succeed" and nothing happens (measured 2026-09-29:
+# document.visibilityState == "hidden" on the tab being clicked). Only an
+# explicit `tab <id>` switch calls Page.bringToFront, so do that once per
+# session before the first input action and after every navigation.
+
+_FRONTED: set = set()
+_INPUT_TOOLS = frozenset({
+    "browser_click", "browser_type", "browser_press", "browser_find", "browser_mouse",
+    "browser_drag", "browser_scroll", "browser_upload", "browser_dropzone_upload",
+    "browser_download", "browser_mouse_wheel",
+})
+
+
+def bring_active_tab_to_front(task_id: Optional[str]) -> bool:
+    if bt._is_camofox_mode():
+        return False
+    tid = bt._last_session_key(task_id or "default")
+    res = bt._run_browser_command(tid, "tab", ["list"], timeout=10)
+    if not res.get("success"):
+        return False
+    tabs, _active = bt._normalize_tab_payload(res.get("data", {}))
+    active = next((t for t in tabs if t.get("active")), None)
+    if not active or not active.get("id"):
+        return False
+    ok = bool(bt._run_browser_command(tid, "tab", [active["id"]], timeout=10).get("success"))
+    if ok:
+        _FRONTED.add(tid)
+    return ok
+
+
 # ── progress guard (stop rule) ────────────────────────────────────────────────
 
 EPISODE_IDLE_RESET_S = 600
@@ -274,11 +309,21 @@ _FRAME_RESET_TOOLS = frozenset({"browser_navigate", "browser_back", "browser_tab
 
 def _wrap_handler(name: str, handler: Callable) -> Callable:
     def wrapped(args, **kw):
+        task_id = kw.get("task_id")
+        if name in _INPUT_TOOLS:
+            try:
+                if bt._last_session_key(task_id or "default") not in _FRONTED:
+                    bring_active_tab_to_front(task_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("bring-to-front preflight failed: %s", exc)
         result = handler(args, **kw)
         if not isinstance(result, str):
             return result
-        task_id = kw.get("task_id")
         try:
+            if name == "browser_navigate" and not _result_failed(result):
+                bring_active_tab_to_front(task_id)
+            elif name == "browser_tab" and not _result_failed(result):
+                _FRONTED.add(bt._last_session_key(task_id or "default"))
             if name in _FRAME_RESET_TOOLS:
                 _clear_frame(task_id)
             if name in _OBSERVE_TOOLS and not _result_failed(result):
