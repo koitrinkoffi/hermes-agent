@@ -60,7 +60,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +338,44 @@ def _pretty_holder(holder: Optional[str]) -> str:
         kind, label = parts[0], ":".join(parts[1:])
         return f"{label}" if kind == "cron" else f"another session ({label})"
     return parts[0] if parts else "another run"
+
+
+# ---- LOCAL MOD 2026-09-16 (Koitrin) ------------------------------------
+# The wait notice used to talk about "the GPU" and told the reader to press
+# Ctrl+C, which means nothing on Telegram. Koitrin wants it to name the cron
+# job that is running and what is queued behind it, in plain words.
+# Best-effort and lock-free on purpose: this runs on the interactive turn's
+# critical path, so it reads jobs.json directly and returns [] on any problem
+# rather than delaying a reply.
+def upcoming_cron_jobs(exclude: str = "", limit: int = 3) -> List[str]:
+    """Names of the next scheduled jobs, soonest first. Never raises."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        home = os.environ.get("HERMES_HOME") or str(_Path.home() / ".hermes")
+        raw = _json.loads((_Path(home) / "cron" / "jobs.json").read_text())
+        jobs = raw if isinstance(raw, list) else raw.get("jobs", raw)
+        if isinstance(jobs, dict):
+            jobs = list(jobs.values())
+        rows = []
+        for j in jobs:
+            if not isinstance(j, dict) or not j.get("enabled"):
+                continue
+            if j.get("paused_at") or str(j.get("state") or "") == "paused":
+                continue
+            name = str(j.get("name") or "")
+            if not name or name == exclude:
+                continue
+            nxt = j.get("next_run_at")
+            if not nxt:
+                continue
+            rows.append((str(nxt), name))
+        rows.sort()
+        return [n for _, n in rows[:limit]]
+    except Exception:
+        return []
+# ---- end LOCAL MOD ------------------------------------------------------
 
 
 def _any_turn_in_flight(conn) -> bool:

@@ -9836,12 +9836,27 @@ class AIAgent:
                     try:
                         from cron.gpu_arbiter import acquire_interactive
 
+                        # LOCAL MOD 2026-09-16 (Koitrin): plain-language wait
+                        # notice. The old text named "the GPU" and told the
+                        # reader to press Ctrl+C, which means nothing on
+                        # Telegram. Name the job and what is queued behind it.
+                        def _gpu_wait_notice(elapsed, blocker):
+                            try:
+                                from cron.gpu_arbiter import upcoming_cron_jobs
+                                queued = upcoming_cron_jobs(exclude=str(blocker or ""))
+                            except Exception:
+                                queued = []
+                            line = (
+                                f"⏳ **{blocker}** is running right now — I'll "
+                                f"answer as soon as it finishes ({int(elapsed)}s so far)."
+                            )
+                            if queued:
+                                line += "\nScheduled after it: " + ", ".join(queued) + "."
+                            self._emit_status(line)
+
                         _gpu_outcome, _gpu_turn_lease_holder = acquire_interactive(
                             str(task_context.get("platform") or "turn"),
-                            on_wait=lambda elapsed, blocker: self._emit_status(
-                                f"⏳ Waiting for the GPU — {blocker} is running "
-                                f"({int(elapsed)}s). Ctrl+C to start anyway."
-                            ),
+                            on_wait=_gpu_wait_notice,
                             should_abort=lambda: getattr(
                                 self, "_interrupt_requested", False
                             ),
@@ -9853,8 +9868,9 @@ class AIAgent:
                         )
                         if _gpu_outcome == "override":
                             self._emit_status(
-                                "Starting now; a background run is still using "
-                                "the GPU, so this turn may be slower."
+                                "Starting your answer now — a scheduled job is "
+                                "still finishing in the background, so this "
+                                "reply may be a little slower."
                             )
                     except Exception:
                         logger.debug(
