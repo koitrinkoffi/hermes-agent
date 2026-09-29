@@ -411,6 +411,14 @@ def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | No
         safe_args = dict(args)
         safe_args["text"] = redact_sensitive_text(args["text"], force=True)
         return safe_args
+    if tool_name == "browser_fill_form" and isinstance(args.get("fields"), list):
+        # Form values are often credentials: never show them, only their length.
+        safe_args = dict(args)
+        safe_args["fields"] = [
+            {**f, "value": f"<{len(str(f.get('value', '')))} chars>"} if isinstance(f, dict) and isinstance(f.get("value"), str) else f
+            for f in args["fields"]
+        ]
+        return safe_args
     return args
 
 

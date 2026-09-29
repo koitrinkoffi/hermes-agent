@@ -75,7 +75,7 @@ _HERMES_CORE_TOOLS = [
     # wait / frame tools replace the eval workarounds measured on Flash-Next
     # (42% of evals were iframe hacks, 13% whole-page innerText dumps), so
     # they must be in front of the model, not behind tool_search.
-    "browser_read", "browser_find", "browser_wait", "browser_frame",
+    "browser_read", "browser_find", "browser_wait", "browser_frame", "browser_fill_form",
     # browser_dialog back to core: a page blocked by a JS dialog must be
     # answerable at once; deferred, the model rewrote window.prompt instead
     # (baseline s06, 2026-09-29).

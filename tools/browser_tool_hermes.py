@@ -167,7 +167,22 @@ def _spill_long_text(text: str, max_chars: int, label: str) -> Tuple[str, Option
 OBSERVATION_MAX_CHARS = 4000
 
 
-def observe_after_action(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+SETTLE_S = 0.3
+SETTLE_LOAD_TIMEOUT_MS = 8000
+
+
+def _settle(tid: str) -> None:
+    """Let a click/submit start its navigation, then wait for the load to end.
+
+    Without it the delta was taken before the navigation began and showed the
+    old page (measured on a login form). Costs ~0.3 s when nothing navigates.
+    """
+    time.sleep(SETTLE_S)
+    bt._run_browser_command(tid, "wait", ["--load", "load", "--timeout", str(SETTLE_LOAD_TIMEOUT_MS)],
+                            timeout=SETTLE_LOAD_TIMEOUT_MS // 1000 + 5)
+
+
+def observe_after_action(task_id: Optional[str], settle: bool = False) -> Optional[Dict[str, Any]]:
     """What changed after an action: url + a snapshot delta (agent-browser >= 0.38).
 
     Returns None when deltas are unsupported (the model then snapshots itself,
@@ -177,6 +192,8 @@ def observe_after_action(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     if not ab_supports_delta() or bt._is_camofox_mode():
         return None
     tid = bt._last_session_key(task_id or "default")
+    if settle:
+        _settle(tid)
     res = bt._run_browser_command(tid, "snapshot", snapshot_flags() + ["--delta"], timeout=20)
     if not res.get("success"):
         return None
@@ -221,13 +238,13 @@ _FRONTED: set = set()
 _INPUT_TOOLS = frozenset({
     "browser_click", "browser_type", "browser_press", "browser_find", "browser_mouse",
     "browser_drag", "browser_scroll", "browser_upload", "browser_dropzone_upload",
-    "browser_download", "browser_mouse_wheel",
+    "browser_download", "browser_mouse_wheel", "browser_fill_form",
 })
 # Tools whose arguments carry snapshot refs: switching tab clears agent-browser's
 # ref map, so after a bring-to-front the refs are rebuilt with a silent snapshot.
 _REF_TOOLS = frozenset({
     "browser_click", "browser_type", "browser_mouse", "browser_drag", "browser_upload",
-    "browser_download", "browser_frame", "browser_read",
+    "browser_download", "browser_frame", "browser_read", "browser_fill_form",
 })
 _OBSERVE_FIRST_TOOLS = _INPUT_TOOLS | {"browser_snapshot", "browser_read", "browser_vision"}
 
@@ -348,7 +365,7 @@ def _with_guidance(result: str, guidance: str) -> str:
     return f"{result}\n\n[guidance] {guidance}"
 
 
-_OBSERVE_TOOLS = frozenset({"browser_click", "browser_type", "browser_press", "browser_find"})
+_OBSERVE_TOOLS = frozenset({"browser_click", "browser_type", "browser_press", "browser_find", "browser_fill_form"})
 _FRAME_RESET_TOOLS = frozenset({"browser_navigate", "browser_back", "browser_tab"})
 
 
@@ -378,12 +395,23 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
                         "The browser window had been closed; Hermes reopened it and it restored its "
                         "previous tabs. Check browser_tab(action='list') before relying on the current page.")
                     result = _json(data)
+            if (name == "browser_navigate" and isinstance(args, dict) and args.get("read")
+                    and not _result_failed(result)):
+                page = json.loads(browser_read(max_chars=NAVIGATE_TEXT_MAX_CHARS, task_id=task_id))
+                data = json.loads(result)
+                if isinstance(data, dict) and page.get("success"):
+                    data["text"] = page.get("text", "")
+                    data["text_chars"] = page.get("chars")
+                    result = _json(data)
             if name == "browser_tab" and not _result_failed(result):
                 _FRONTED.add(bt._last_session_key(task_id or "default"))
             if name in _FRAME_RESET_TOOLS:
                 _clear_frame(task_id)
             if name in _OBSERVE_TOOLS and not _result_failed(result) and '"dialog_opened": true' not in result:
-                obs = observe_after_action(task_id)
+                # Typing into a field never navigates; clicks, keys and submits may.
+                navigating = name != "browser_type" and not (
+                    name == "browser_fill_form" and '"submitted"' not in result)
+                obs = observe_after_action(task_id, settle=navigating)
                 if obs is not None:
                     data = json.loads(result)
                     if isinstance(data, dict):
@@ -405,9 +433,12 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
 
 
 def browser_read(selector: Optional[str] = None, ref: Optional[str] = None, filter: Optional[str] = None,
-                 outline: bool = False, max_chars: Optional[int] = None, task_id: Optional[str] = None) -> str:
+                 outline: bool = False, max_chars: Optional[int] = None, task_id: Optional[str] = None,
+                 frames: bool = False) -> str:
     if bt._is_camofox_mode():
         return bt._browser_tool_unsupported_in_camofox("browser_read")
+    if frames:
+        return browser_read_frames(task_id=task_id, max_chars=max_chars)
     tid = bt._last_session_key(task_id or "default")
     target = _target(ref, selector)
     if not target and frame_selected(task_id or "default") and not (filter or outline):
@@ -559,6 +590,136 @@ def browser_frame(ref: Optional[str] = None, selector: Optional[str] = None, mai
     })
 
 
+def browser_fill_form(fields: List[Dict[str, Any]], submit_ref: Optional[str] = None,
+                      submit_text: Optional[str] = None, press_enter: bool = False,
+                      task_id: Optional[str] = None) -> str:
+    """Fill several fields (and optionally submit) in ONE tool call.
+
+    A login used to take 3-8 model turns (type, type, click, snapshot...);
+    every turn costs ~4.7 s on Flash-Next while the browser work itself is
+    ~0.1 s per field.
+    """
+    if bt._is_camofox_mode():
+        return bt._browser_tool_unsupported_in_camofox("browser_fill_form")
+    if not isinstance(fields, list) or not fields:
+        return _json({"success": False, "error": "`fields` must be a non-empty list of {ref|selector|label|placeholder, value}."})
+    tid = bt._last_session_key(task_id or "default")
+    report: List[Dict[str, Any]] = []
+    all_ok = True
+    for i, f in enumerate(fields):
+        if not isinstance(f, dict) or "value" not in f:
+            report.append({"field": i, "ok": False, "error": "each field needs a locator and a value"})
+            all_ok = False
+            continue
+        value = f["value"]
+        target = _target(f.get("ref"), f.get("selector"))
+        label = f.get("label") or f.get("placeholder")
+        by = "label" if f.get("label") else "placeholder"
+        where = target or f"{by}={label}"
+        if target:
+            if isinstance(value, bool):
+                res = bt._run_browser_command(tid, "check" if value else "uncheck", [target])
+            else:
+                res = bt._run_browser_command(tid, "fill", [target, str(value)])
+                if not res.get("success"):
+                    # <select> elements refuse fill: pick the option instead.
+                    alt = bt._run_browser_command(tid, "select", [target, str(value)])
+                    if alt.get("success"):
+                        res = alt
+        elif label:
+            action = ("check" if value else "uncheck") if isinstance(value, bool) else "fill"
+            args = [by, str(label), action] + ([] if isinstance(value, bool) else [str(value)])
+            res = bt._run_browser_command(tid, "find", args)
+        else:
+            res = {"success": False, "error": "no ref, selector, label or placeholder"}
+        ok = bool(res.get("success"))
+        entry: Dict[str, Any] = {"field": where, "ok": ok}
+        if not ok:
+            entry["error"] = str(res.get("error", "failed"))[:300]
+            all_ok = False
+        report.append(entry)
+    out: Dict[str, Any] = {"success": all_ok, "fields": report}
+    if not all_ok:
+        out["error"] = "Some fields could not be filled; nothing was submitted."
+        return _json(out)
+    submitted = None
+    if submit_ref:
+        res = bt._run_browser_command(tid, "click", [bt._normalize_ref(submit_ref)])
+        submitted = f"click {bt._normalize_ref(submit_ref)}"
+    elif submit_text:
+        res = bt._run_browser_command(tid, "find", ["role", "button", "click", "--name", submit_text])
+        if not res.get("success"):
+            res = bt._run_browser_command(tid, "find", ["text", submit_text, "click"])
+        submitted = f"click '{submit_text}'"
+    elif press_enter:
+        res = bt._run_browser_command(tid, "press", ["Enter"])
+        submitted = "press Enter"
+    else:
+        res = {"success": True}
+    if submitted:
+        out["submitted"] = submitted
+        if not res.get("success"):
+            out["success"] = False
+            out["error"] = f"Fields filled but submit failed: {str(res.get('error', ''))[:300]}"
+        data = res.get("data") or {}
+        if isinstance(data, dict) and data.get("dialogOpened"):
+            out["dialog_opened"] = True
+    return _json(out)
+
+
+def _frame_texts(tree: str) -> List[Dict[str, Any]]:
+    """Group the visible text of every (nested) iframe of a full snapshot tree."""
+    lines = tree.split("\n")
+    frames: List[Dict[str, Any]] = []
+    stack: List[Tuple[int, Dict[str, Any]]] = []  # (indent, frame)
+    for line in lines:
+        stripped = line.lstrip(" ")
+        if not stripped.startswith("- "):
+            continue
+        indent = len(line) - len(stripped)
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        body = stripped[2:]
+        if body.startswith("Iframe"):
+            name = re.search(r'Iframe "([^"]*)"', body)
+            ref = re.search(r"\[ref=(e\d+)", body)
+            frame = {"frame": f"@{ref.group(1)}" if ref else None,
+                     "name": name.group(1) if name else "",
+                     "inside": stack[-1][1]["frame"] if stack else None,
+                     "_text": []}
+            frames.append(frame)
+            stack.append((indent, frame))
+            continue
+        if not stack:
+            continue
+        m = re.search(r'"((?:[^"\\]|\\.)*)"', body)
+        if m and m.group(1).strip():
+            text = m.group(1).strip()
+            owner = stack[-1][1]["_text"]
+            if not owner or owner[-1] != text:
+                owner.append(text)
+    for f in frames:
+        f["text"] = "\n".join(f.pop("_text"))
+    return frames
+
+
+def browser_read_frames(task_id: Optional[str] = None, max_chars: Optional[int] = None) -> str:
+    """Text of every iframe (nested ones included) in one call."""
+    tid = bt._last_session_key(task_id or "default")
+    res = bt._run_browser_command(tid, "snapshot", snapshot_flags(compact=False), timeout=30)
+    if not res.get("success"):
+        return _json({"success": False, "error": res.get("error", "Could not snapshot the page")})
+    tree = normalize_snapshot_data(res.get("data", {}) or {}).get("snapshot", "") or ""
+    frames = _frame_texts(tree)
+    limit = max(1000, min(int(max_chars) if max_chars else bt.get_browser_snapshot_threshold(), 60000))
+    per = max(500, limit // max(1, len(frames)))
+    for f in frames:
+        f["text"] = bt._redact_browser_output(_spill_long_text(f["text"], per, "frame text")[0])
+    return _json({"success": True, "frames": frames, "count": len(frames),
+                  "note": "Select one with browser_frame(ref=...) to act inside it." if frames
+                  else "This page has no iframe."})
+
+
 # ── schemas & registration ────────────────────────────────────────────────────
 
 SCHEMAS: Dict[str, Dict[str, Any]] = {
@@ -578,6 +739,7 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
                 "selector": {"type": "string", "description": "CSS selector of the element to read (alternative to ref)"},
                 "filter": {"type": "string", "description": "Only keep page sections that mention this text"},
                 "outline": {"type": "boolean", "description": "Return only the heading outline of the page"},
+                "frames": {"type": "boolean", "description": "Return the text of EVERY iframe on the page (nested ones included), grouped per frame with its ref - one call instead of selecting frames one by one"},
                 "max_chars": {"type": "integer", "description": "Max characters returned (default 15000); the rest is saved to a file you can page with read_file"},
             },
             "required": [],
@@ -655,7 +817,8 @@ registry.register(
     name="browser_read", toolset="browser", schema=SCHEMAS["browser_read"],
     handler=lambda args, **kw: browser_read(
         selector=args.get("selector"), ref=args.get("ref"), filter=args.get("filter"),
-        outline=bool(args.get("outline")), max_chars=args.get("max_chars"), task_id=kw.get("task_id")),
+        outline=bool(args.get("outline")), max_chars=args.get("max_chars"), task_id=kw.get("task_id"),
+        frames=bool(args.get("frames"))),
     check_fn=bt.check_browser_requirements, emoji=_EMOJI["browser_read"],
 )
 
@@ -2020,6 +2183,66 @@ registry.register(
 )
 
 
+SCHEMAS["browser_fill_form"] = {
+    "name": "browser_fill_form",
+    "description": (
+        "Fill a whole form in ONE call, then optionally submit it: each field by its ref (from the snapshot), "
+        "CSS selector, visible label or placeholder, with the text to enter (true/false ticks a checkbox; a "
+        "<select> gets the matching option). Submit with submit_ref (the button's ref), submit_text (the "
+        "button's text) or press_enter. Nothing is submitted if a field fails. The result shows what changed. "
+        "Prefer this to several browser_type calls - each extra call is a whole extra turn."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "fields": {
+                "type": "array",
+                "description": "Fields to fill, in order",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ref": {"type": "string", "description": "Field ref from the snapshot (e.g. '@e6')"},
+                        "selector": {"type": "string", "description": "CSS selector of the field"},
+                        "label": {"type": "string", "description": "Visible label of the field"},
+                        "placeholder": {"type": "string", "description": "Placeholder text of the field"},
+                        "value": {"description": "Text to enter, or true/false for a checkbox"},
+                    },
+                    "required": ["value"],
+                },
+            },
+            "submit_ref": {"type": "string", "description": "Ref of the submit button to click after filling"},
+            "submit_text": {"type": "string", "description": "Text of the submit button to click after filling"},
+            "press_enter": {"type": "boolean", "description": "Press Enter after filling (submits most forms)"},
+        },
+        "required": ["fields"],
+    },
+}
+
+registry.register(
+    name="browser_fill_form", toolset="browser", schema=SCHEMAS["browser_fill_form"],
+    handler=lambda args, **kw: browser_fill_form(
+        fields=args.get("fields") or [], submit_ref=args.get("submit_ref"), submit_text=args.get("submit_text"),
+        press_enter=bool(args.get("press_enter")), task_id=kw.get("task_id")),
+    check_fn=bt.check_browser_requirements, emoji="📝",
+)
+
+
+def _extend_navigate_schema() -> None:
+    """browser_navigate(read=true) also returns the page text (saves a browser_read turn)."""
+    entry = registry.get_entry("browser_navigate")
+    if entry is None:
+        return
+    props = entry.schema.setdefault("parameters", {}).setdefault("properties", {})
+    props.setdefault("read", {
+        "type": "boolean",
+        "description": ("Also return the page as clean text (headings, paragraphs, tables) in `text` - use it "
+                        "when the task is to READ the page, instead of a separate browser_read call"),
+    })
+
+
+NAVIGATE_TEXT_MAX_CHARS = 12000
+
+
 def _install_wrappers() -> None:
     """Wrap every registered browser_* handler with observation + progress guard."""
     for name in list(getattr(registry, "_tools", {}).keys()):
@@ -2033,4 +2256,5 @@ def _install_wrappers() -> None:
         entry.handler = _wrap_handler(name, entry.handler)
 
 
+_extend_navigate_schema()
 _install_wrappers()

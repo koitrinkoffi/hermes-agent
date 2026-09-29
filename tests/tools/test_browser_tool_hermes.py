@@ -84,14 +84,14 @@ def test_observation_kinds(monkeypatch, snap, expect):
 
 
 def test_observation_attached_to_click(monkeypatch):
-    monkeypatch.setattr(bh, "observe_after_action", lambda task_id: {"url": "https://x/", "page": "changed"})
+    monkeypatch.setattr(bh, "observe_after_action", lambda task_id, settle=False: {"url": "https://x/", "page": "changed"})
     handler = bh._wrap_handler("browser_click", lambda args, **kw: json.dumps({"success": True, "clicked": "@e1"}))
     out = json.loads(handler({"ref": "@e1"}, task_id="t"))
     assert out["observation"]["page"] == "changed"
 
 
 def test_no_observation_on_failure(monkeypatch):
-    monkeypatch.setattr(bh, "observe_after_action", lambda task_id: pytest.fail("must not observe after a failure"))
+    monkeypatch.setattr(bh, "observe_after_action", lambda task_id, settle=False: pytest.fail("must not observe after a failure"))
     handler = bh._wrap_handler("browser_click", lambda args, **kw: json.dumps({"success": False, "error": "x"}))
     assert "observation" not in json.loads(handler({"ref": "@e1"}, task_id="t"))
 
