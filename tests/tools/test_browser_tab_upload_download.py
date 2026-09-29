@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import tools.browser_tool as bt
+import tools.browser_tool_hermes as bh
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def test_browser_tab_list_normalizes_rich_response(non_camofox, monkeypatch):
         },
     )
 
-    result = json.loads(bt.browser_tab(action="list", task_id="t1"))
+    result = json.loads(bh.browser_tab(action="list", task_id="t1"))
 
     assert result["success"] is True
     assert result["active_index"] == 2
@@ -54,7 +55,7 @@ def test_browser_tab_new_with_url_creates_then_navigates(non_camofox, monkeypatc
 
     monkeypatch.setattr(bt, "_run_browser_command", fake_run)
 
-    result = json.loads(bt.browser_tab(action="new", url="https://example.com", task_id="t1"))
+    result = json.loads(bh.browser_tab(action="new", url="https://example.com", task_id="t1"))
 
     assert result == {"success": True, "action": "new", "url": "https://example.com",
                       "active_index": 2, "tab_count": 2}
@@ -77,16 +78,16 @@ def test_browser_tab_switch_translates_index_to_tab_id(non_camofox, monkeypatch)
         return {"success": True, "data": {}}
 
     monkeypatch.setattr(bt, "_run_browser_command", fake_run)
-    out = json.loads(bt.browser_tab(action="switch", index=2, task_id="t1"))
+    out = json.loads(bh.browser_tab(action="switch", index=2, task_id="t1"))
     assert out["success"] is True and out["active_index"] == 2 and out["url"] == "https://b/"
     assert ["t7"] in calls and ["2"] not in calls
-    out = json.loads(bt.browser_tab(action="close", tab_id="t7", task_id="t1"))
+    out = json.loads(bh.browser_tab(action="close", tab_id="t7", task_id="t1"))
     assert ["close", "t7"] in calls
-    out = json.loads(bt.browser_tab(action="switch", index=5, task_id="t1"))
+    out = json.loads(bh.browser_tab(action="switch", index=5, task_id="t1"))
     assert out["success"] is False and "out of range" in out["error"]
 
 def test_browser_tab_switch_requires_positive_1_based_index(non_camofox):
-    result = json.loads(bt.browser_tab(action="switch", index=0, task_id="t1"))
+    result = json.loads(bh.browser_tab(action="switch", index=0, task_id="t1"))
     assert result["success"] is False
     assert "1-based index" in result["error"]
 
@@ -106,7 +107,7 @@ def test_browser_upload_validates_and_normalizes_paths(non_camofox, monkeypatch,
     monkeypatch.setattr(bt, "_run_browser_command", fake_run)
 
     result = json.loads(
-        bt.browser_upload(ref="e9", path=str(first), paths=[str(second)], task_id="t1")
+        bh.browser_upload(ref="e9", path=str(first), paths=[str(second)], task_id="t1")
     )
 
     assert result == {
@@ -135,7 +136,7 @@ def test_browser_upload_missing_path_fails_fast(non_camofox, monkeypatch, tmp_pa
     monkeypatch.setattr(bt, "_run_browser_command", fake_run)
 
     missing = tmp_path / "missing.txt"
-    result = json.loads(bt.browser_upload(ref="@e1", path=str(missing), task_id="t1"))
+    result = json.loads(bh.browser_upload(ref="@e1", path=str(missing), task_id="t1"))
 
     assert result["success"] is False
     assert str(missing.resolve()) in result["error"]
@@ -153,14 +154,14 @@ def test_browser_upload_accepts_selector_passthrough(non_camofox, monkeypatch, t
 
     monkeypatch.setattr(bt, "_run_browser_command", fake_run)
 
-    result = json.loads(bt.browser_upload(ref="input[type=file]", path=str(file_path), task_id="t1"))
+    result = json.loads(bh.browser_upload(ref="input[type=file]", path=str(file_path), task_id="t1"))
 
     assert result["success"] is True
     assert captured["args"][0] == "input[type=file]"
 
 
 def test_browser_download_uses_default_path_and_verifies_file(non_camofox, monkeypatch, tmp_path):
-    monkeypatch.setattr(bt, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(bh, "get_hermes_home", lambda: tmp_path)
 
     def fake_run(task_id, command, args, timeout=None, **kwargs):
         assert task_id == "session::t1"
@@ -172,7 +173,7 @@ def test_browser_download_uses_default_path_and_verifies_file(non_camofox, monke
 
     monkeypatch.setattr(bt, "_run_browser_command", fake_run)
 
-    result = json.loads(bt.browser_download(ref="e4", task_id="t1"))
+    result = json.loads(bh.browser_download(ref="e4", task_id="t1"))
 
     assert result["success"] is True
     assert result["exists"] is True
@@ -182,14 +183,14 @@ def test_browser_download_uses_default_path_and_verifies_file(non_camofox, monke
 
 
 def test_browser_download_reports_missing_file_after_success(non_camofox, monkeypatch, tmp_path):
-    monkeypatch.setattr(bt, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(bh, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         bt,
         "_run_browser_command",
         lambda task_id, command, args, timeout=None, **kwargs: {"success": True, "data": {}},
     )
 
-    result = json.loads(bt.browser_download(ref="@e2", task_id="t1"))
+    result = json.loads(bh.browser_download(ref="@e2", task_id="t1"))
 
     assert result["success"] is False
     assert "file was not found" in result["error"]
@@ -221,7 +222,7 @@ def test_browser_upload_camofox_ref_routes_and_matches_shape(camofox, tmp_path):
     second.write_text("b", encoding="utf-8")
 
     result = json.loads(
-        bt.browser_upload(ref="e9", path=str(first), paths=[str(second)], task_id="t1")
+        bh.browser_upload(ref="e9", path=str(first), paths=[str(second)], task_id="t1")
     )
 
     # Response shape is identical to the agent-browser backend.
@@ -245,7 +246,7 @@ def test_browser_upload_camofox_routes_selector(camofox, tmp_path):
     file_path.write_text("hello", encoding="utf-8")
 
     result = json.loads(
-        bt.browser_upload(ref="input[type=file]", path=str(file_path), task_id="t1")
+        bh.browser_upload(ref="input[type=file]", path=str(file_path), task_id="t1")
     )
 
     assert result["success"] is True
@@ -258,7 +259,7 @@ def test_browser_upload_camofox_routes_selector(camofox, tmp_path):
 def test_browser_upload_camofox_validates_before_dispatch(camofox, tmp_path):
     missing = tmp_path / "missing.txt"
 
-    result = json.loads(bt.browser_upload(ref="e1", path=str(missing), task_id="t1"))
+    result = json.loads(bh.browser_upload(ref="e1", path=str(missing), task_id="t1"))
 
     assert result["success"] is False
     assert str(missing.resolve()) in result["error"]

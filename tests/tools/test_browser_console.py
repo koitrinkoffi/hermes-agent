@@ -5,6 +5,8 @@ import os
 import sys
 from unittest.mock import patch, MagicMock
 
+from tools.browser_tool import browser_console
+
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -17,7 +19,7 @@ class TestBrowserConsole:
     """browser_console() returns console messages + JS errors in one call."""
 
     def test_returns_console_messages_and_errors(self):
-        from tools.browser_tool import browser_console
+        from tools.browser_tool_hermes import browser_eval
 
         console_response = {
             "success": True,
@@ -49,7 +51,7 @@ class TestBrowserConsole:
         assert result["js_errors"][0]["message"] == "Uncaught TypeError"
 
     def test_passes_clear_flag(self):
-        from tools.browser_tool import browser_console
+        from tools.browser_tool_hermes import browser_eval
 
         empty = {"success": True, "data": {"messages": [], "errors": []}}
         with patch("tools.browser_tool._run_browser_command", return_value=empty) as mock_cmd:
@@ -62,7 +64,7 @@ class TestBrowserConsole:
 
 
     def test_redacts_secrets_from_console_messages_and_errors(self):
-        from tools.browser_tool import browser_console
+        from tools.browser_tool_hermes import browser_eval
 
         fake_key = "sk-" + "BROWSERCONSOLESECRET1234567890"
         console_response = {
@@ -108,7 +110,7 @@ class TestBrowserConsole:
         unless browser.restrict_evaluate is set. Egress to private addresses is
         still guarded separately in _browser_eval.
         """
-        from tools.browser_tool import browser_console
+        from tools.browser_tool_hermes import browser_eval
 
         expressions = [
             "document.cookie",
@@ -119,18 +121,18 @@ class TestBrowserConsole:
         ]
         with patch("tools.browser_tool._browser_eval", return_value=json.dumps({"success": True, "result": "ok"})) as mock_eval:
             for expr in expressions:
-                result = json.loads(browser_console(expression=expr, task_id="test"))
+                result = json.loads(browser_eval(expression=expr, task_id="test"))
                 assert result == {"success": True, "result": "ok"}, expr
 
         assert mock_eval.call_count == len(expressions)
 
     def test_expression_blocks_cookie_access_before_eval(self):
-        from tools.browser_tool import browser_console
+        from tools.browser_tool_hermes import browser_eval
 
         with patch("tools.browser_tool._restrict_browser_evaluate", return_value=True), \
              patch("tools.browser_tool._allow_unsafe_browser_evaluate", return_value=False), \
              patch("tools.browser_tool._browser_eval") as mock_eval:
-            result = json.loads(browser_console(expression="document.cookie", task_id="test"))
+            result = json.loads(browser_eval(expression="document.cookie", task_id="test"))
 
         assert result["success"] is False
         assert "Blocked" in result["error"]
@@ -138,7 +140,7 @@ class TestBrowserConsole:
         mock_eval.assert_not_called()
 
     def test_expression_blocks_storage_and_network_access_before_eval(self):
-        from tools.browser_tool import browser_console
+        from tools.browser_tool_hermes import browser_eval
 
         risky_expressions = [
             "localStorage.getItem('token')",
@@ -153,7 +155,7 @@ class TestBrowserConsole:
              patch("tools.browser_tool._allow_unsafe_browser_evaluate", return_value=False), \
              patch("tools.browser_tool._browser_eval") as mock_eval:
             for expr in risky_expressions:
-                result = json.loads(browser_console(expression=expr, task_id="test"))
+                result = json.loads(browser_eval(expression=expr, task_id="test"))
                 assert result["success"] is False, expr
                 assert "Blocked" in result["error"], expr
 
