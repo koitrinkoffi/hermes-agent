@@ -39,22 +39,51 @@ def test_browser_tab_list_normalizes_rich_response(non_camofox, monkeypatch):
 
 
 def test_browser_tab_new_with_url_creates_then_navigates(non_camofox, monkeypatch):
+    """`tab new <url>` opens and navigates in one agent-browser call, then a
+    listing reports where the new tab sits."""
     calls = []
 
     def fake_run(task_id, command, args, timeout=None, **kwargs):
         calls.append((task_id, command, args, timeout))
+        if args == ["list"]:
+            return {"success": True, "data": {"tabs": [
+                {"tabId": "t1", "title": "a", "url": "about:blank", "active": False},
+                {"tabId": "t2", "title": "Example", "url": "https://example.com/", "active": True},
+            ]}}
         return {"success": True, "data": {}}
 
     monkeypatch.setattr(bt, "_run_browser_command", fake_run)
 
     result = json.loads(bt.browser_tab(action="new", url="https://example.com", task_id="t1"))
 
-    assert result == {"success": True, "action": "new", "url": "https://example.com"}
-    assert calls == [
-        ("session::t1", "tab", ["new"], None),
-        ("session::t1", "open", ["https://example.com"], 60),
-    ]
+    assert result == {"success": True, "action": "new", "url": "https://example.com",
+                      "active_index": 2, "tab_count": 2}
+    assert calls[0][1:3] == ("tab", ["new", "https://example.com"])
+    assert calls[1][1:3] == ("tab", ["list"])
 
+
+def test_browser_tab_switch_translates_index_to_tab_id(non_camofox, monkeypatch):
+    """agent-browser >= 0.26 rejects integer tab indexes: the 1-based position
+    must be sent as the stable tN id from a fresh listing."""
+    calls = []
+
+    def fake_run(task_id, command, args, timeout=None, **kwargs):
+        calls.append(args)
+        if args == ["list"]:
+            return {"success": True, "data": {"tabs": [
+                {"tabId": "t1", "title": "a", "url": "https://a/", "active": True},
+                {"tabId": "t7", "title": "b", "url": "https://b/", "active": False},
+            ]}}
+        return {"success": True, "data": {}}
+
+    monkeypatch.setattr(bt, "_run_browser_command", fake_run)
+    out = json.loads(bt.browser_tab(action="switch", index=2, task_id="t1"))
+    assert out["success"] is True and out["active_index"] == 2 and out["url"] == "https://b/"
+    assert ["t7"] in calls and ["2"] not in calls
+    out = json.loads(bt.browser_tab(action="close", tab_id="t7", task_id="t1"))
+    assert ["close", "t7"] in calls
+    out = json.loads(bt.browser_tab(action="switch", index=5, task_id="t1"))
+    assert out["success"] is False and "out of range" in out["error"]
 
 def test_browser_tab_switch_requires_positive_1_based_index(non_camofox):
     result = json.loads(bt.browser_tab(action="switch", index=0, task_id="t1"))

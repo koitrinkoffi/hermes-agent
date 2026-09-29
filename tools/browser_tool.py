@@ -6142,9 +6142,15 @@ def _browser_eval(expression: str, task_id: Optional[str] = None, timeout: Optio
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
         supervisor = None if _in_frame else SUPERVISOR_REGISTRY.get(effective_task_id)
         if supervisor is not None:
+            # Only ask agent-browser which tab is active when there is a
+            # choice: one WS round trip keeps single-tab evals subprocess-free.
+            try:
+                _multi_tab = len(supervisor.page_target_ids()) > 1
+            except Exception:
+                _multi_tab = False
             sup_result = supervisor.evaluate_runtime(
                 expression,
-                target_id=_active_tab_target_id(effective_task_id),
+                target_id=_active_tab_target_id(effective_task_id) if _multi_tab else None,
                 timeout=eval_timeout,
             )
             if sup_result.get("ok"):

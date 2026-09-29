@@ -60,7 +60,10 @@ class TestBrowserEvalSupervisorPath:
         assert out["success"] is True
         assert out["result"] == 42
         assert out["method"] == "cdp_supervisor"
-        sup.evaluate_runtime.assert_called_once_with("1 + 41")
+        sup.evaluate_runtime.assert_called_once()
+        assert sup.evaluate_runtime.call_args.args == ("1 + 41",)
+        # single tab (MagicMock page_target_ids -> empty) -> no tab routing
+        assert sup.evaluate_runtime.call_args.kwargs.get("target_id") is None
 
     def test_json_string_result_is_parsed(self, monkeypatch):
         """Match agent-browser semantics: JSON-string results get parsed."""

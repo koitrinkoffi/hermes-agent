@@ -534,6 +534,27 @@ class CDPSupervisor:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
         return {"ok": True, "dialog": snapshot_copy.to_dict()}
 
+    def page_target_ids(self, timeout: float = 3.0) -> List[str]:
+        """CDP targetIds of every open tab (``type == "page"``), over the live WS.
+
+        Cheap (one round trip, no subprocess); lets callers skip the
+        agent-browser active-tab lookup when only one tab exists.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return []
+        from agent.async_utils import safe_schedule_threadsafe
+
+        fut = safe_schedule_threadsafe(self._cdp("Target.getTargets", timeout=timeout), loop)
+        if fut is None:
+            return []
+        try:
+            resp = fut.result(timeout=timeout + 1)
+        except Exception:
+            return []
+        infos = (resp or {}).get("result", {}).get("targetInfos", [])
+        return [t.get("targetId") for t in infos if t.get("type") == "page" and t.get("targetId")]
+
     def evaluate_runtime(
         self,
         expression: str,
