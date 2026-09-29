@@ -226,13 +226,12 @@ def observe_after_action(task_id: Optional[str], settle: bool = False) -> Option
 
 # ── keep the acted-on tab visible ─────────────────────────────────────────────
 #
-# When agent-browser attaches over CDP to an already-open browser it takes the
-# FIRST tab as its active tab without bringing it to front, while the window
-# shows another (restored) tab. Chromium ignores synthetic input sent to a
-# hidden tab: clicks "succeed" and nothing happens (measured 2026-09-29:
-# document.visibilityState == "hidden" on the tab being clicked). Only an
-# explicit `tab <id>` switch calls Page.bringToFront, so do that once per
-# session before the first input action and after every navigation.
+# Chromium ignores synthetic input sent to a hidden tab: clicks report success
+# and nothing happens. The hermes fork of agent-browser (0.38.1-hermes.2)
+# makes the VISIBLE tab active on attach and keeps refs when re-selecting the
+# active tab; what is left for Hermes is the case where someone switched tabs
+# in the window meanwhile: probe visibility before observing/acting and
+# re-select the active tab (Page.bringToFront) only when it is hidden.
 
 _FRONTED: set = set()
 _INPUT_TOOLS = frozenset({
@@ -240,13 +239,7 @@ _INPUT_TOOLS = frozenset({
     "browser_drag", "browser_scroll", "browser_upload", "browser_dropzone_upload",
     "browser_download", "browser_mouse_wheel", "browser_fill_form",
 })
-# Tools whose arguments carry snapshot refs: switching tab clears agent-browser's
-# ref map, so after a bring-to-front the refs are rebuilt with a silent snapshot.
-_REF_TOOLS = frozenset({
-    "browser_click", "browser_type", "browser_mouse", "browser_drag", "browser_upload",
-    "browser_download", "browser_frame", "browser_read", "browser_fill_form",
-})
-_OBSERVE_FIRST_TOOLS = _INPUT_TOOLS | {"browser_snapshot", "browser_read", "browser_vision"}
+_OBSERVE_FIRST_TOOLS = _INPUT_TOOLS | {"browser_snapshot", "browser_read", "browser_vision", "browser_navigate"}
 
 
 def active_tab_hidden(task_id: Optional[str]) -> bool:
@@ -276,18 +269,15 @@ def bring_active_tab_to_front(task_id: Optional[str]) -> bool:
 
 
 def _front_preflight(name: str, args: Dict[str, Any], task_id: Optional[str]) -> None:
-    tid = bt._last_session_key(task_id or "default")
-    if name == "browser_navigate":
-        # The navigation replaces the page and its refs anyway: always safe.
-        bring_active_tab_to_front(task_id)
-        return
     if name not in _OBSERVE_FIRST_TOOLS:
         return
-    if not active_tab_hidden(task_id):
+    tid = bt._last_session_key(task_id or "default")
+    if tid not in bt._active_sessions:
+        return  # no browser session yet: nothing can be hidden
+    if active_tab_hidden(task_id):
+        bring_active_tab_to_front(task_id)
+    else:
         _FRONTED.add(tid)
-        return
-    if bring_active_tab_to_front(task_id) and name in _REF_TOOLS and name != "browser_snapshot":
-        bt._run_browser_command(tid, "snapshot", snapshot_flags(baseline=True), timeout=20)
 
 
 # ── progress guard (stop rule) ────────────────────────────────────────────────

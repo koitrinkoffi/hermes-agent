@@ -199,33 +199,32 @@ def test_frame_tracks_selection(monkeypatch):
 
 # ── bring-to-front preflight (real function, fakes underneath) ────────────────
 
-def test_preflight_navigate_always_fronts(monkeypatch):
-    monkeypatch.undo()  # drop the autouse no-op preflight
-    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
-    monkeypatch.setattr(bt, "_last_session_key", lambda task_id: f"session::{task_id}")
-    fronted = []
-    monkeypatch.setattr(bh, "bring_active_tab_to_front", lambda task_id: fronted.append(task_id) or True)
-    monkeypatch.setattr(bh, "active_tab_hidden", lambda task_id: pytest.fail("navigate must not probe"))
-    bh._front_preflight("browser_navigate", {"url": "https://x"}, "t")
-    assert fronted == ["t"]
-
-
-def test_preflight_hidden_tab_fronts_then_rebuilds_refs(monkeypatch):
+def test_preflight_hidden_tab_is_brought_to_front(monkeypatch):
     monkeypatch.undo()
     monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
     monkeypatch.setattr(bt, "_last_session_key", lambda task_id: f"session::{task_id}")
-    monkeypatch.setattr(bh, "agent_browser_version", lambda: ((0, 38, 1), "agent-browser 0.38.1"))
+    monkeypatch.setattr(bt, "_active_sessions", {"session::t": {}})
+    fronted = []
     calls = _recorder(monkeypatch)
     monkeypatch.setattr(bh, "active_tab_hidden", lambda task_id: True)
-    monkeypatch.setattr(bh, "bring_active_tab_to_front", lambda task_id: True)
+    monkeypatch.setattr(bh, "bring_active_tab_to_front", lambda task_id: fronted.append(task_id) or True)
     bh._front_preflight("browser_click", {"ref": "@e3"}, "t")
-    assert calls == [("snapshot", ["-c", "--delta", "--full"])]
+    assert fronted == ["t"] and calls == []   # refs are kept by the fork: no re-snapshot
+
+
+def test_preflight_without_session_does_nothing(monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(bt, "_last_session_key", lambda task_id: f"session::{task_id}")
+    monkeypatch.setattr(bt, "_active_sessions", {})
+    monkeypatch.setattr(bh, "active_tab_hidden", lambda task_id: pytest.fail("no session: no probe"))
+    bh._front_preflight("browser_navigate", {"url": "https://x"}, "t")
 
 
 def test_preflight_visible_tab_does_nothing(monkeypatch):
     monkeypatch.undo()
     monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
     monkeypatch.setattr(bt, "_last_session_key", lambda task_id: f"session::{task_id}")
+    monkeypatch.setattr(bt, "_active_sessions", {"session::t": {}})
     monkeypatch.setattr(bh, "active_tab_hidden", lambda task_id: False)
     monkeypatch.setattr(bh, "bring_active_tab_to_front", lambda task_id: pytest.fail("visible tab: no switch"))
     bh._front_preflight("browser_click", {"ref": "@e3"}, "t")
