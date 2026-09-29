@@ -2,7 +2,11 @@
 
 Everything here is specific to this fork, kept out of ``browser_tool.py`` so a
 future upstream merge (upstream split that file into ~12 modules) only has to
-re-home one self-contained module.
+re-home one self-contained module. ``browser_tool.py`` keeps upstream's tools
+plus the managed-browser lifecycle (browser_start / browser_close); the
+fork-only tools live here: browser_tab, browser_upload,
+browser_dropzone_upload, browser_download, browser_eval, browser_pdf,
+browser_mouse, browser_mouse_wheel, browser_drag, and the ones below.
 
 What it adds, and the measurement that motivated it (Flash-Next, 1,403
 browser calls, 2026-09-08 → 09-29):
