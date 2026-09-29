@@ -267,3 +267,25 @@ def test_other_cdp_overrides_stay_remote(monkeypatch, override, managed):
     monkeypatch.setattr(bt, "_get_cdp_override_raw", lambda: override)
     monkeypatch.setattr(bt, "_MANAGED_CDP_URL", managed)
     assert bt._is_local_backend() is False
+
+
+def test_unknown_ref_gets_fresh_snapshot(monkeypatch):
+    monkeypatch.setattr(bh, "agent_browser_version", lambda: ((0, 38, 1), "agent-browser 0.38.1"))
+    _recorder(monkeypatch, {"snapshot": {"success": True, "data": {"snapshot": {"kind": "full", "tree": "- button \"Go\" [ref=e41]", "refs": {}}}}})
+    handler = bh._wrap_handler("browser_click", lambda args, **kw: json.dumps({"success": False, "error": "Unknown ref: e6"}))
+    out = json.loads(handler({"ref": "@e6"}, task_id="t"))
+    assert out["success"] is False
+    assert "ref=e41" in out["fresh_snapshot"] and "fresh_snapshot" in out["next"]
+
+
+def test_scroll_repeat_until(monkeypatch):
+    evals = iter([False, 100, False, 200, True])
+    monkeypatch.setattr(bt, "_browser_eval", lambda expr, task_id=None, timeout=None: json.dumps({"success": True, "result": next(evals)}))
+    monkeypatch.setattr(bh.time, "sleep", lambda s: None)
+    calls = _recorder(monkeypatch)
+    handler = bh._wrap_handler("browser_scroll", lambda args, **kw: pytest.fail("repeat mode scrolls whole pages itself"))
+    out = json.loads(handler({"direction": "down", "until": "x > 1"}, task_id="t"))
+    assert out["scrolls"] == 3 and out["condition_met"] is True
+    assert calls == [("scroll", ["down", "5000"])] * 3
+    out = json.loads(handler({"direction": "down", "repeat": 4}, task_id="t"))
+    assert out["scrolls"] == 4 and "condition_met" not in out

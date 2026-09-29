@@ -366,9 +366,29 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
             _front_preflight(name, args if isinstance(args, dict) else {}, task_id)
         except Exception as exc:  # noqa: BLE001
             logger.debug("bring-to-front preflight failed: %s", exc)
-        result = handler(args, **kw)
+        if name == "browser_scroll" and isinstance(args, dict) and (args.get("repeat") or args.get("until")):
+            result = _repeat_scroll(handler, args, kw)
+        else:
+            result = handler(args, **kw)
         if not isinstance(result, str):
             return result
+        # A ref the daemon no longer knows (its ref map was reset: new daemon,
+        # navigation, replaced element) is useless to retry: hand the model a
+        # fresh compact snapshot in the same result so it can pick the new ref
+        # without spending a turn on browser_snapshot.
+        if "Unknown ref" in result and _result_failed(result):
+            try:
+                tid = bt._last_session_key(task_id or "default")
+                snap = bt._run_browser_command(tid, "snapshot", snapshot_flags(baseline=True), timeout=20)
+                if snap.get("success"):
+                    tree = normalize_snapshot_data(snap.get("data", {}) or {}).get("snapshot", "") or ""
+                    data = json.loads(result)
+                    data["fresh_snapshot"] = bt._redact_browser_output(
+                        _spill_long_text(tree, OBSERVATION_MAX_CHARS, "snapshot")[0])
+                    data["next"] = "Refs were reset. Use the refs from fresh_snapshot."
+                    result = _json(data)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("fresh snapshot after unknown ref failed: %s", exc)
         # agent-browser's own errors name its CLI verbs; point at the Hermes tool.
         if "`dialog accept` or `dialog dismiss`" in result:
             result = result.replace(
@@ -2231,6 +2251,82 @@ def _extend_navigate_schema() -> None:
 
 
 NAVIGATE_TEXT_MAX_CHARS = 12000
+SCROLL_MAX_REPEAT = 50
+SCROLL_STEP_PX = 5000
+
+
+def _extend_scroll_schema() -> None:
+    """browser_scroll(repeat=N, until=js): scroll many times in ONE call.
+
+    An infinite-scroll page cost two turns per scroll (scroll, then wait):
+    47 calls to load 50 paragraphs on the-internet's infinite_scroll.
+    """
+    entry = registry.get_entry("browser_scroll")
+    if entry is None:
+        return
+    props = entry.schema.setdefault("parameters", {}).setdefault("properties", {})
+    props.setdefault("repeat", {"type": "integer",
+                                "description": f"Scroll this many times in one call (max {SCROLL_MAX_REPEAT}), pausing between scrolls so lazy content loads"})
+    props.setdefault("until", {"type": "string",
+                               "description": ("JavaScript condition checked after each scroll; stop as soon as it is true, e.g. "
+                                               "\"document.querySelectorAll('.item').length >= 50\"")})
+    props.setdefault("pause_ms", {"type": "integer", "description": "Pause after each scroll for content to load (default 600)"})
+    props.setdefault("timeout", {"type": "number", "description": "With `until`: give up after this many seconds (default 60, max 180)"})
+
+
+def _repeat_scroll(handler: Callable, args: Dict[str, Any], kw: Dict[str, Any]) -> str:
+    """repeat=N scrolls N whole pages; until=js keeps scrolling until the
+    condition holds, the page stops growing (5 scrolls), or `timeout` runs out."""
+    direction = args.get("direction", "down")
+    if direction not in ("up", "down"):
+        return _json({"success": False, "error": f"Invalid direction '{direction}'. Use 'up' or 'down'."})
+    until = args.get("until")
+    repeat = max(1, min(int(args.get("repeat") or 1), SCROLL_MAX_REPEAT))
+    pause = max(0, min(int(args.get("pause_ms") or 600), 5000)) / 1000.0
+    budget = max(5.0, min(float(args.get("timeout") or 60), 180.0))
+    task_id = kw.get("task_id")
+    tid = bt._last_session_key(task_id or "default")
+
+    def page_height() -> Optional[int]:
+        out = json.loads(bt._browser_eval("document.documentElement.scrollHeight", task_id, timeout=5))
+        return out.get("result") if out.get("success") else None
+
+    done, met, stalled, last_h = 0, False, 0, None
+    deadline = time.time() + budget
+    result = _json({"success": False, "error": "no scroll performed"})
+    while True:
+        # Whole-page steps: lazy loaders fire when the bottom is reached.
+        res = bt._run_browser_command(tid, "scroll", [direction, str(SCROLL_STEP_PX)])
+        result = _json({"success": True, "scrolled": direction} if res.get("success")
+                       else {"success": False, "error": res.get("error", f"Failed to scroll {direction}")})
+        if not res.get("success"):
+            break
+        done += 1
+        time.sleep(pause)
+        if not until:
+            if done >= repeat:
+                break
+            continue
+        check = json.loads(bt._browser_eval(f"Boolean({until})", task_id, timeout=5))
+        if check.get("success") and check.get("result") is True:
+            met = True
+            break
+        h = page_height()
+        stalled = stalled + 1 if (h is not None and h == last_h) else 0
+        last_h = h
+        if stalled >= 5 or time.time() >= deadline:
+            break
+    try:
+        data = json.loads(result)
+    except Exception:
+        return result
+    if isinstance(data, dict):
+        data["scrolls"] = done
+        if until:
+            data["condition_met"] = met
+            if not met:
+                data["stopped"] = "page stopped growing" if stalled >= 5 else f"time budget ({budget:g}s) used"
+    return _json(data)
 
 
 def _install_wrappers() -> None:
@@ -2247,4 +2343,5 @@ def _install_wrappers() -> None:
 
 
 _extend_navigate_schema()
+_extend_scroll_schema()
 _install_wrappers()
