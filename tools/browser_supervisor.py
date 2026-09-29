@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 MAX_POST_ATTACH_RECONNECT_FAILURES = 5
 
 
+def _is_loopback_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).hostname or "") in ("127.0.0.1", "localhost", "::1")
+    except Exception:
+        return False
+
+
 def _loopback_connect_kwargs(url: str) -> Dict[str, Any]:
     """``proxy=None`` for loopback endpoints when websockets honours env proxies.
 
@@ -876,7 +884,13 @@ class CDPSupervisor:
         # a synchronous XHR we intercept via Fetch domain. This is how we make
         # dialog response work on Browserbase (whose CDP proxy auto-dismisses
         # real native dialogs before we can call handleJavaScriptDialog).
-        await self._install_dialog_bridge(self._page_session_id)
+        #
+        # hermes-mods: skipped for a loopback endpoint (the local managed
+        # browser). There the native Page.javascriptDialogOpening path works,
+        # and the bridge's synchronous XHR froze the renderer inside the click
+        # handler, so the click command itself hung until its 30 s timeout.
+        if not _is_loopback_url(self.cdp_url):
+            await self._install_dialog_bridge(self._page_session_id)
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session.
