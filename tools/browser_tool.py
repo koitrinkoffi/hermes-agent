@@ -1231,6 +1231,18 @@ def _is_local_mode() -> bool:
     return _get_cloud_provider() is None
 
 
+def _cdp_override_is_managed_loopback() -> bool:
+    """True when the CDP override is the managed browser's own loopback endpoint."""
+    raw = _get_cdp_override_raw()
+    if not raw or not _MANAGED_CDP_URL or raw != _MANAGED_CDP_URL:
+        return False
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(raw).hostname or "") in ("127.0.0.1", "localhost", "::1")
+    except Exception:
+        return False
+
+
 def _is_local_backend() -> bool:
     """Return True when the browser runs locally AND the terminal is also local.
 
@@ -1258,7 +1270,12 @@ def _is_local_backend() -> bool:
     # config (both via _get_cdp_override(), and both now suppress camofox in
     # browser_camofox.py). _is_local_mode() already treats any CDP override as
     # non-local; keep the two helpers in agreement.
-    if _get_cdp_override_raw():
+    #
+    # Exception (approved by Koitrin 2026-09-29): the managed persistent-profile
+    # browser publishes its OWN loopback endpoint through BROWSER_CDP_URL
+    # (_ensure_managed_browser). It runs on this host, launched by this
+    # process, so its network position is the terminal's.
+    if _get_cdp_override_raw() and not _cdp_override_is_managed_loopback():
         return False
     if _is_camofox_mode():
         return True

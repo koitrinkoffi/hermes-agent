@@ -246,3 +246,25 @@ def test_dialog_falls_back_to_agent_browser(monkeypatch):
     assert out["success"] is True and out["via"] == "agent-browser"
     assert "lifecycle" not in out["dialog"]
     assert calls == [("dialog", ["accept", "Hermes"])]
+
+
+# ── managed loopback CDP browser counts as local ──────────────────────────────
+
+def test_managed_loopback_cdp_is_local(monkeypatch):
+    monkeypatch.setattr(bt, "_get_cdp_override_raw", lambda: "http://127.0.0.1:45861")
+    monkeypatch.setattr(bt, "_MANAGED_CDP_URL", "http://127.0.0.1:45861")
+    monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+    assert bt._cdp_override_is_managed_loopback() is True
+    assert bt._is_local_backend() is True
+
+
+@pytest.mark.parametrize("override,managed", [
+    ("http://127.0.0.1:45861", None),                  # someone else's endpoint (/browser connect)
+    ("http://127.0.0.1:9222", "http://127.0.0.1:45861"),
+    ("http://10.0.0.5:9222", "http://10.0.0.5:9222"),   # managed but not loopback
+])
+def test_other_cdp_overrides_stay_remote(monkeypatch, override, managed):
+    monkeypatch.setattr(bt, "_get_cdp_override_raw", lambda: override)
+    monkeypatch.setattr(bt, "_MANAGED_CDP_URL", managed)
+    assert bt._is_local_backend() is False
