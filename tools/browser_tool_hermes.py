@@ -80,11 +80,16 @@ def ab_is_hermes_fork() -> bool:
     return "hermes" in agent_browser_version()[1]
 
 
+DEFAULT_FRAME_DEPTH = 3
+
+
 def snapshot_flags(*, compact: bool = True, baseline: bool = False) -> List[str]:
     """Flags every Hermes snapshot shares, so delta baselines stay comparable."""
     flags: List[str] = ["-c"] if compact else []
     if ab_is_hermes_fork():
-        flags.append("--prune")
+        # Nested iframes (e-learning players, payment widgets) are common;
+        # upstream only inlines one level.
+        flags += ["--prune", "--frame-depth", str(DEFAULT_FRAME_DEPTH)]
     if baseline and ab_supports_delta():
         flags += ["--delta", "--full"]
     return flags
@@ -356,6 +361,16 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
                 "`dialog accept` or `dialog dismiss`",
                 "browser_dialog(action='accept', prompt_text=...) or browser_dialog(action='dismiss')")
         try:
+            _key = bt._last_session_key(task_id or "default")
+            if _key in bt.RELAUNCH_NOTICES:
+                bt.RELAUNCH_NOTICES.discard(_key)
+                _FRONTED.discard(_key)
+                data = json.loads(result)
+                if isinstance(data, dict):
+                    data["browser_relaunched"] = (
+                        "The browser window had been closed; Hermes reopened it and it restored its "
+                        "previous tabs. Check browser_tab(action='list') before relying on the current page.")
+                    result = _json(data)
             if name == "browser_tab" and not _result_failed(result):
                 _FRONTED.add(bt._last_session_key(task_id or "default"))
             if name in _FRAME_RESET_TOOLS:
@@ -387,6 +402,10 @@ def browser_read(selector: Optional[str] = None, ref: Optional[str] = None, filt
         return bt._browser_tool_unsupported_in_camofox("browser_read")
     tid = bt._last_session_key(task_id or "default")
     target = _target(ref, selector)
+    if not target and frame_selected(task_id or "default") and not (filter or outline):
+        # agent-browser's `read` always reads the top document; element text
+        # reads honour the frame selected with browser_frame.
+        target = "body"
     limit = int(max_chars) if max_chars else bt.get_browser_snapshot_threshold()
     limit = max(1000, min(limit, 60000))
     if target:

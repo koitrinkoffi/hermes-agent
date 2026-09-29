@@ -3462,7 +3462,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_download",
-        "description": "Download a file by clicking an element identified by its ref ID. If no path is provided, Hermes saves it to a persistent default downloads directory and returns the absolute path. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Download a file by clicking its link or button (ref from the snapshot) and save it locally. Also works when the click opens a PDF in the browser viewer instead of downloading it. Returns the saved path and size. If `path` is omitted, Hermes picks a persistent default location.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3473,6 +3473,10 @@ BROWSER_TOOL_SCHEMAS = [
                 "path": {
                     "type": "string",
                     "description": "Optional destination file path. If omitted, Hermes chooses a persistent default path."
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait for the file (default 60, max 300)"
                 }
             },
             "required": ["ref"]
@@ -4369,6 +4373,12 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
+# Session keys whose browser was relaunched under them; the next tool result
+# says so (tools/browser_tool_hermes.py) - the relaunched window restores its
+# previous tabs, so the active page may not be the one the model expects.
+RELAUNCH_NOTICES: set = set()
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -4739,6 +4749,7 @@ def _run_browser_command(
         and _managed_browser_applies()
     ):
         logger.info("browser '%s': CDP endpoint refused - relaunching the managed browser and retrying", command)
+        RELAUNCH_NOTICES.add(task_id)
         try:
             _ensure_managed_browser(task_id)
             # The cached session still carries the dead endpoint, and the CDP
@@ -7066,7 +7077,8 @@ def browser_dropzone_upload(selector: Optional[str] = None, path: Optional[str] 
     }, ensure_ascii=False)
 
 
-def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str] = None) -> str:
+def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str] = None,
+                     timeout: Optional[float] = None) -> str:
     """Download a file by clicking an element and saving it locally."""
     if _is_camofox_mode():
         return _camofox_browser_download(ref=ref, path=path, task_id=task_id)
@@ -7074,12 +7086,26 @@ def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str
     effective_task_id = _last_session_key(task_id or "default")
     normalized_ref = _normalize_ref(ref)
     target_path = _normalize_download_path(path)
+    try:
+        wait_s = float(timeout) if timeout else 60.0
+    except (TypeError, ValueError):
+        wait_s = 60.0
+    wait_s = max(5.0, min(wait_s, 300.0))
+    args = [normalized_ref, str(target_path)]
+    try:
+        from tools.browser_tool_hermes import ab_is_hermes_fork
+        if ab_is_hermes_fork():
+            # Stock agent-browser hard-codes a 30 s download timeout: all 6
+            # Flash-Next download attempts died at exactly 30.1 s.
+            args += ["--timeout", str(int(wait_s * 1000))]
+    except Exception:
+        pass
 
     result = _run_browser_command(
         effective_task_id,
         "download",
-        [normalized_ref, str(target_path)],
-        timeout=max(_get_command_timeout(), 60),
+        args,
+        timeout=int(max(_get_command_timeout(), wait_s + 15)),
     )
 
     if not result.get("success"):
@@ -7098,8 +7124,13 @@ def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str
         "success": True,
         "path": str(target_path),
         "exists": True,
+        "size_bytes": target_path.stat().st_size,
         "element": normalized_ref,
     }
+    _data = result.get("data") or {}
+    if isinstance(_data, dict) and _data.get("mode"):
+        # "download" or "inline_pdf" (a PDF the click opened in the viewer).
+        response["mode"] = _data["mode"]
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
@@ -8703,6 +8734,7 @@ registry.register(
         ref=args.get("ref", ""),
         path=args.get("path"),
         task_id=kw.get("task_id"),
+        timeout=args.get("timeout"),
     ),
     check_fn=check_browser_requirements,
     emoji="📥",

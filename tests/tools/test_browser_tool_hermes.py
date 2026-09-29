@@ -52,7 +52,7 @@ def test_normalize_snapshot_data_keeps_old_shape():
 
 def test_snapshot_flags(monkeypatch):
     monkeypatch.setattr(bh, "agent_browser_version", lambda: ((0, 38, 1), "agent-browser 0.38.1-hermes.1"))
-    assert bh.snapshot_flags(baseline=True) == ["-c", "--prune", "--delta", "--full"]
+    assert bh.snapshot_flags(baseline=True) == ["-c", "--prune", "--frame-depth", "3", "--delta", "--full"]
     monkeypatch.setattr(bh, "agent_browser_version", lambda: ((0, 35, 1), "agent-browser 0.35.1"))
     assert bh.snapshot_flags(baseline=True) == ["-c"]
 
