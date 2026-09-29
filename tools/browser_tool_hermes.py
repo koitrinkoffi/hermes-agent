@@ -120,6 +120,8 @@ def normalize_snapshot_data(data: Dict[str, Any]) -> Dict[str, Any]:
 # ── per-task state: selected frame ────────────────────────────────────────────
 
 _FRAME_SELECTED: Dict[str, str] = {}
+# Last page URL the model saw per session (navigate / snapshot / observation).
+_LAST_URL: Dict[str, str] = {}
 
 
 def frame_selected(task_id: str) -> Optional[str]:
@@ -381,12 +383,27 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
                 tid = bt._last_session_key(task_id or "default")
                 snap = bt._run_browser_command(tid, "snapshot", snapshot_flags(baseline=True), timeout=20)
                 if snap.get("success"):
-                    tree = normalize_snapshot_data(snap.get("data", {}) or {}).get("snapshot", "") or ""
-                    data = json.loads(result)
-                    data["fresh_snapshot"] = bt._redact_browser_output(
-                        _spill_long_text(tree, OBSERVATION_MAX_CHARS, "snapshot")[0])
-                    data["next"] = "Refs were reset. Use the refs from fresh_snapshot."
-                    result = _json(data)
+                    sdata = normalize_snapshot_data(snap.get("data", {}) or {})
+                    tree = sdata.get("snapshot", "") or ""
+                    ref = str((args or {}).get("ref", "")).lstrip("@") if isinstance(args, dict) else ""
+                    same_page = bool(sdata.get("origin")) and sdata.get("origin") == _LAST_URL.get(tid)
+                    if ref and same_page and re.search(rf"\bref={re.escape(ref)}[\],]", tree):
+                        # The daemon's ref map was reset but the page is the one the
+                        # model saw: the rebuilt map has the same element - retry once.
+                        retried = handler(args, **kw)
+                        if isinstance(retried, str) and not _result_failed(retried):
+                            data = json.loads(retried)
+                            if isinstance(data, dict):
+                                data["note"] = "Refs were rebuilt after a reset; the action was retried."
+                                result = _json(data)
+                            else:
+                                result = retried
+                    if _result_failed(result):
+                        data = json.loads(result)
+                        data["fresh_snapshot"] = bt._redact_browser_output(
+                            _spill_long_text(tree, OBSERVATION_MAX_CHARS, "snapshot")[0])
+                        data["next"] = "Refs were reset. Use the refs from fresh_snapshot."
+                        result = _json(data)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("fresh snapshot after unknown ref failed: %s", exc)
         # agent-browser's own errors name its CLI verbs; point at the Hermes tool.
@@ -396,6 +413,13 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
                 "browser_dialog(action='accept', prompt_text=...) or browser_dialog(action='dismiss')")
         try:
             _key = bt._last_session_key(task_id or "default")
+            if name in ("browser_navigate", "browser_snapshot", "browser_back") and not _result_failed(result):
+                try:
+                    _u = json.loads(result).get("url")
+                    if _u:
+                        _LAST_URL[_key] = _u
+                except Exception:
+                    pass
             if _key in bt.RELAUNCH_NOTICES:
                 bt.RELAUNCH_NOTICES.discard(_key)
                 _FRONTED.discard(_key)
@@ -418,10 +442,13 @@ def _wrap_handler(name: str, handler: Callable) -> Callable:
             if name in _FRAME_RESET_TOOLS:
                 _clear_frame(task_id)
             if name in _OBSERVE_TOOLS and not _result_failed(result) and '"dialog_opened": true' not in result:
+                # (observation below also refreshes _LAST_URL)
                 # Typing into a field never navigates; clicks, keys and submits may.
                 navigating = name != "browser_type" and not (
                     name == "browser_fill_form" and '"submitted"' not in result)
                 obs = observe_after_action(task_id, settle=navigating)
+                if obs and obs.get("url"):
+                    _LAST_URL[bt._last_session_key(task_id or "default")] = obs["url"]
                 if obs is not None:
                     data = json.loads(result)
                     if isinstance(data, dict):

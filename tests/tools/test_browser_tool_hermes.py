@@ -17,6 +17,7 @@ def _isolate(monkeypatch):
     bh._PROGRESS.clear()
     bh._FRAME_SELECTED.clear()
     bh._FRONTED.clear()
+    bh._LAST_URL.clear()
     yield
 
 
@@ -289,3 +290,28 @@ def test_scroll_repeat_until(monkeypatch):
     assert calls == [("scroll", ["down", "5000"])] * 3
     out = json.loads(handler({"direction": "down", "repeat": 4}, task_id="t"))
     assert out["scrolls"] == 4 and "condition_met" not in out
+
+
+def test_unknown_ref_retried_on_same_page(monkeypatch):
+    monkeypatch.setattr(bh, "agent_browser_version", lambda: ((0, 38, 1), "agent-browser 0.38.1"))
+    _recorder(monkeypatch, {"snapshot": {"success": True, "data": {"origin": "https://x/p",
+              "snapshot": {"kind": "full", "tree": "- button \"Go\" [ref=e6]", "refs": {}}}}})
+    bh._LAST_URL["session::t"] = "https://x/p"
+    attempts = []
+    def click(args, **kw):
+        attempts.append(1)
+        return json.dumps({"success": False, "error": "Unknown ref: e6"} if len(attempts) == 1 else {"success": True, "clicked": "@e6"})
+    monkeypatch.setattr(bh, "observe_after_action", lambda task_id, settle=False: None)
+    out = json.loads(bh._wrap_handler("browser_click", click)({"ref": "@e6"}, task_id="t"))
+    assert out["success"] is True and len(attempts) == 2 and "retried" in out["note"]
+
+
+def test_unknown_ref_not_retried_on_other_page(monkeypatch):
+    monkeypatch.setattr(bh, "agent_browser_version", lambda: ((0, 38, 1), "agent-browser 0.38.1"))
+    _recorder(monkeypatch, {"snapshot": {"success": True, "data": {"origin": "https://x/other",
+              "snapshot": {"kind": "full", "tree": "- button \"Go\" [ref=e6]", "refs": {}}}}})
+    bh._LAST_URL["session::t"] = "https://x/p"
+    attempts = []
+    click = lambda args, **kw: attempts.append(1) or json.dumps({"success": False, "error": "Unknown ref: e6"})
+    out = json.loads(bh._wrap_handler("browser_click", click)({"ref": "@e6"}, task_id="t"))
+    assert len(attempts) == 1 and "fresh_snapshot" in out
