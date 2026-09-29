@@ -402,6 +402,20 @@ def ensure_running(
             return base, False
         time.sleep(0.4)
 
+    # The browser we just started is detached by construction, and NOTHING
+    # upstream recorded it: browser_tool._ensure_managed_browser only assigns
+    # _MANAGED_CDP_URL on the success branch, so an exception here leaves a
+    # process no cleanup path can ever find again - not the inactivity net, not
+    # the orphan reaper, not browser_close, not `hermes_browser.py status`
+    # (which cheerfully reports running: false while it burns a core).
+    #
+    # Measured 2026-09-14: one immo-watch cron run produced nine such orphans in
+    # fifteen minutes.  The survivor sat in ppoll at 175,414 syscalls/s, dragged
+    # kwin_wayland to 65% CPU, and held SingletonLock - so every later launch
+    # failed exactly the same way.  Reap before raising; a browser that never
+    # reached CDP has no session worth preserving.
+    _reap_failed_launch(profile)
+
     env = launch_env()
     display = env.get("DISPLAY") or env.get("WAYLAND_DISPLAY") or "<none>"
     raise RuntimeError(
@@ -436,6 +450,48 @@ def _browser_pids(profile: pathlib.Path) -> List[int]:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return pids
+
+
+def _reap_failed_launch(profile: pathlib.Path) -> None:
+    """SIGTERM whatever a timed-out launch left behind for *profile*.
+
+    SIGTERM only, never SIGKILL - same rule as ``close_browser``.  A launch that
+    never exposed CDP cannot be closed through ``Browser.close``, so the signal
+    is the only exit; it writes ``exit_type: "SessionEnded"``, which is safe.
+    (``"Crashed"`` is not merely a restore bubble on Brave 1.94: it makes every
+    subsequent headed startup die with SIGTRAP, and the profile cannot recover
+    on its own because a browser that dies early never rewrites Preferences.)
+
+    Best-effort and never raises: the caller is already on its way to reporting
+    a launch failure, and that error is the one worth surfacing.
+    """
+    import signal
+
+    try:
+        pids = _browser_pids(profile)
+    except Exception as exc:  # pragma: no cover - psutil quirks
+        logger.debug("Could not enumerate browser pids after failed launch: %s", exc)
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            logger.warning(
+                "Reaped orphaned browser pid %s left by a launch that never "
+                "exposed CDP (profile %s)", pid, profile,
+            )
+        except OSError as exc:
+            logger.debug("Could not SIGTERM orphaned browser pid %s: %s", pid, exc)
+
+    # Chromium removes SingletonLock on a clean SIGTERM; if it did not, the next
+    # launch inherits a lock naming a dead pid and fails for a second reason.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            if not _browser_pids(profile):
+                break
+        except Exception:
+            break
+        time.sleep(0.3)
 
 
 def _cdp_browser_close(base: str) -> bool:
