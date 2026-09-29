@@ -257,9 +257,7 @@ def _front_preflight(name: str, args: Dict[str, Any], task_id: Optional[str]) ->
         return
     if name not in _OBSERVE_FIRST_TOOLS:
         return
-    if tid in _FRONTED and not active_tab_hidden(task_id):
-        return
-    if tid not in _FRONTED and not active_tab_hidden(task_id):
+    if not active_tab_hidden(task_id):
         _FRONTED.add(tid)
         return
     if bring_active_tab_to_front(task_id) and name in _REF_TOOLS and name != "browser_snapshot":
