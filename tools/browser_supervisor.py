@@ -341,6 +341,10 @@ class CDPSupervisor:
         self._pending_calls: Dict[int, asyncio.Future] = {}
         self._ws: Optional[ClientConnection] = None
         self._page_session_id: Optional[str] = None
+        self._page_target_id: Optional[str] = None
+        # Sessions attached on demand to OTHER tabs so evaluate_runtime can run
+        # in the tab agent-browser is acting on (target_id -> session_id).
+        self._eval_sessions: Dict[str, str] = {}
         self._child_sessions: Dict[str, Dict[str, Any]] = {}  # session_id -> info
 
         # Dialog auto-dismiss watchdog handles (per dialog id).
@@ -511,6 +515,8 @@ class CDPSupervisor:
         return_by_value: bool = True,
         await_promise: bool = True,
         timeout: float = 10.0,
+        target_id: Optional[str] = None,
+        repl_mode: bool = True,
     ) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
 
@@ -525,6 +531,16 @@ class CDPSupervisor:
         before sending it back, matching DevTools-console semantics for
         primitive / plain-object expressions. For DOM nodes or non-serializable
         objects, the browser returns a description string in ``result_type``.
+
+        ``target_id`` selects the tab to evaluate in. The supervisor's own page
+        session is bound to whichever tab existed when it attached; without
+        this, an eval after a tab switch silently read the FIRST tab while
+        click/snapshot acted on the active one. Other tabs get a flattened
+        session attached on first use and cached.
+
+        ``repl_mode`` (CDP ``replMode``) lets an expression use top-level
+        ``await`` and re-declare ``let``/``const`` across calls, like the
+        DevTools console.
         """
         loop = self._loop
         if loop is None or not loop.is_running():
@@ -538,20 +554,41 @@ class CDPSupervisor:
         if not session_id:
             return {"ok": False, "error": "supervisor has no attached page session"}
 
-        async def _do_eval(by_value: bool) -> Dict[str, Any]:
-            return await self._cdp(
-                "Runtime.evaluate",
-                {
-                    "expression": expression,
-                    "returnByValue": by_value,
-                    "awaitPromise": await_promise,
-                    # userGesture matters for things like clipboard / fullscreen
-                    # APIs that require a user-activation context.
-                    "userGesture": True,
-                },
-                session_id=session_id,
-                timeout=timeout,
+        async def _session_for_target() -> str:
+            if not target_id or target_id == self._page_target_id:
+                return session_id
+            cached = self._eval_sessions.get(target_id)
+            if cached:
+                return cached
+            attach = await self._cdp(
+                "Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=5.0,
             )
+            new_sid = attach["result"]["sessionId"]
+            self._eval_sessions[target_id] = new_sid
+            return new_sid
+
+        async def _do_eval(by_value: bool) -> Dict[str, Any]:
+            params = {
+                "expression": expression,
+                "returnByValue": by_value,
+                "awaitPromise": await_promise,
+                # userGesture matters for things like clipboard / fullscreen
+                # APIs that require a user-activation context.
+                "userGesture": True,
+            }
+            if repl_mode:
+                params["replMode"] = True
+            sid = await _session_for_target()
+            try:
+                return await self._cdp("Runtime.evaluate", params, session_id=sid, timeout=timeout)
+            except Exception as exc:
+                # A cached session dies with its tab (closed, crashed, replaced):
+                # drop it and re-attach once.
+                if sid != session_id and target_id in self._eval_sessions and "session" in str(exc).lower():
+                    self._eval_sessions.pop(target_id, None)
+                    sid = await _session_for_target()
+                    return await self._cdp("Runtime.evaluate", params, session_id=sid, timeout=timeout)
+                raise
 
         from agent.async_utils import safe_schedule_threadsafe
 
@@ -680,6 +717,8 @@ class CDPSupervisor:
                 # Reset per-connection session state so stale ids don't hang
                 # around after a reconnect.
                 self._page_session_id = None
+                self._page_target_id = None
+                self._eval_sessions.clear()
                 self._child_sessions.clear()
                 # We deliberately keep `_pending_dialogs` and `_frames` —
                 # they're reconciled as the supervisor resubscribes and
@@ -754,6 +793,7 @@ class CDPSupervisor:
             {"targetId": target_id, "flatten": True},
         )
         self._page_session_id = attach["result"]["sessionId"]
+        self._page_target_id = target_id
         await self._cdp("Page.enable", session_id=self._page_session_id)
         await self._cdp("Runtime.enable", session_id=self._page_session_id)
         await self._cdp(
@@ -1334,6 +1374,9 @@ class CDPSupervisor:
         if not sid:
             return
         self._child_sessions.pop(sid, None)
+        for tid, esid in list(self._eval_sessions.items()):
+            if esid == sid:
+                self._eval_sessions.pop(tid, None)
         with self._state_lock:
             for fid, frame in list(self._frames.items()):
                 if frame.cdp_session_id == sid:

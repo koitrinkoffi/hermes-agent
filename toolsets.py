@@ -71,6 +71,11 @@ _HERMES_CORE_TOOLS = [
     "browser_download", "browser_dropzone_upload",
     "browser_pdf",
     "browser_tab", "browser_upload",
+    # hermes-mods 2026-09-29 (tools/browser_tool_hermes.py): the read / find /
+    # wait / frame tools replace the eval workarounds measured on Flash-Next
+    # (42% of evals were iframe hacks, 13% whole-page innerText dumps), so
+    # they must be in front of the model, not behind tool_search.
+    "browser_read", "browser_find", "browser_wait", "browser_frame",
     # browser_close is pinned core (2026-08-29) while browser_start stays
     # deferred. The browser is now detached from Hermes's lifetime: nothing
     # closes the window but this tool, so the reflex has to be visible in the

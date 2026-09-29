@@ -3156,14 +3156,26 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
+        "description": "Get the page's accessibility tree with ref IDs (like @e5) for browser_click / browser_type / browser_frame. Default: compact view of the whole page. To keep it short on big pages, scope it with `selector` (CSS or a ref, e.g. 'main', 'form', '@e12'), set interactive_only=true (only clickable/typable elements), or limit `depth`. full=true returns every node. Over 15000 chars the output is cut and the rest saved to a file you can page with read_file - to READ long content prefer browser_read. browser_navigate already returns a compact snapshot, and click/type/press/find return what changed, so call this only when you need a fresh complete view.",
         "parameters": {
             "type": "object",
             "properties": {
                 "full": {
                     "type": "boolean",
-                    "description": "If true, returns complete page content. If false (default), returns compact view with interactive elements only.",
+                    "description": "If true, returns complete page content. If false (default), returns compact view with interactive elements.",
                     "default": False
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "Only snapshot this part of the page: a CSS selector or a ref (e.g. 'main', '#results', '@e12')"
+                },
+                "interactive_only": {
+                    "type": "boolean",
+                    "description": "Only list interactive elements (buttons, links, inputs...)"
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Maximum tree depth"
                 }
             },
             "required": []
@@ -3171,7 +3183,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click an element by its ref from the latest snapshot (e.g. '@e5'). The result's `observation` gives the page URL and only what changed on the page, so a new browser_snapshot is usually unnecessary. Inside an iframe, select it first with browser_frame. To click something by its visible text or role without a snapshot, use browser_find.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3185,7 +3197,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type text into an input identified by its ref from the snapshot; the field is cleared first. The result's `observation` shows what changed. To fill a field by its label or placeholder without a snapshot, use browser_find(action='fill').",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3203,7 +3215,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_scroll",
-        "description": "Scroll the page in a direction. Use this to reveal more content that may be below or above the current viewport. Requires browser_navigate to be called first.",
+        "description": "Scroll the page up or down by about half a screen (for lazy-loaded content or to bring something into view). Content already present in a snapshot or browser_read does not need scrolling.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3274,7 +3286,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_back",
-        "description": "Navigate back to the previous page in browser history. Requires browser_navigate to be called first.",
+        "description": "Go back to the previous page in the tab's history.",
         "parameters": {
             "type": "object",
             "properties": {},
@@ -3283,7 +3295,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_press",
-        "description": "Press a keyboard key. Useful for submitting forms (Enter), navigating (Tab), or keyboard shortcuts. Requires browser_navigate to be called first.",
+        "description": "Press a keyboard key or chord on the focused element: Enter (submit), Tab, Escape, ArrowDown, Control+a... The result's `observation` shows what changed.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3325,7 +3337,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_console",
-        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use this for DOM inspection, reading page state, or extracting data programmatically.",
+        "description": "Get the page's console messages (log/warn/error) and uncaught JavaScript exceptions - use it to diagnose a page that silently fails. To run JavaScript use browser_eval.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3333,10 +3345,6 @@ BROWSER_TOOL_SCHEMAS = [
                     "type": "boolean",
                     "default": False,
                     "description": "If true, clear the message buffers after reading"
-                },
-                "expression": {
-                    "type": "string",
-                    "description": "JavaScript expression to evaluate in the page context. Runs in the browser like DevTools console — full access to DOM, window, document. Return values are serialized to JSON. Example: 'document.title' or 'document.querySelectorAll(\"a\").length'"
                 }
             },
             "required": []
@@ -3344,7 +3352,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_tab",
-        "description": "Manage browser tabs. Supports creating a new tab, listing open tabs, switching to a tab by 1-based index, or closing a tab. When no index is provided for close, closes the active tab. Requires browser_navigate to be called first.",
+        "description": "Manage browser tabs: 'list' shows every open tab (index, id, title, url, active); 'switch' makes a tab the active one (all other browser tools act on the active tab); 'new' opens a tab (optionally at a URL) and makes it active; 'close' closes a tab (the active one when no index/tab_id is given). Links that open a new tab switch to it automatically - call 'list' if you are unsure which tab is active.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3356,7 +3364,11 @@ BROWSER_TOOL_SCHEMAS = [
                 "index": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "1-based tab index for switch or close"
+                    "description": "1-based position of the tab as shown by action='list' (for switch or close)"
+                },
+                "tab_id": {
+                    "type": "string",
+                    "description": "Alternative to index: the tab's id from action='list' (e.g. 't2')"
                 },
                 "url": {
                     "type": "string",
@@ -3432,13 +3444,17 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_eval",
-        "description": "Execute a JavaScript expression in the current page and return its result. Use this to READ structured data from the DOM in one cheap call (e.g. pull a listing's fields out of window.__NEXT_DATA__ or JSON-LD, count/collect elements, scroll an inner container). Do NOT use it to INTERACT: for clicking, typing, scrolling the page, or navigating, always prefer browser_click / browser_type / browser_scroll / browser_navigate — they are more reliable than synthetic JS events and keep the accessibility tree in sync. Rule of thumb: reading the page → eval is great; changing the page → use the dedicated tool.",
+        "description": "Run a JavaScript expression in the active tab (inside the iframe selected with browser_frame, if any) and return its value. Best for READING structured data in one call: collect a list of items as JSON, pull window.__NEXT_DATA__ / JSON-LD, count elements. Top-level await works. Do NOT use it to click, type, scroll or navigate (use browser_click / browser_type / browser_find / browser_navigate), to read plain page text (use browser_read), or to reach into iframes via contentDocument (use browser_frame).",
         "parameters": {
             "type": "object",
             "properties": {
                 "expression": {
                     "type": "string",
                     "description": "JavaScript expression to evaluate (e.g., \"document.querySelectorAll('.price').length\"). Async/await is supported."
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds before giving up (default 10, max 60) - raise it for slow async work"
                 }
             },
             "required": ["expression"]
@@ -3460,7 +3476,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_mouse",
-        "description": "Low-level mouse control: move the cursor, press/release a button, or hover an element. Combine move/down/up for custom gestures; use hover to trigger menus and tooltips. Target with a snapshot ref, a CSS selector, or absolute viewport x/y coordinates.",
+        "description": "Low-level mouse: move / down / up / hover, by ref, CSS selector or viewport x/y. Only for gestures the other tools cannot do (sliders, drag handles, canvas, hover menus). For ordinary clicks use browser_click or browser_find - clicking by computed coordinates is fragile.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -4310,6 +4326,7 @@ def _run_browser_command(
     args: List[str] = None,
     timeout: Optional[int] = None,
     _engine_override: Optional[str] = None,
+    _relaunched: bool = False,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -4661,6 +4678,37 @@ def _run_browser_command(
             if not vp_result.get("success"):
                 logger.debug("viewport re-apply failed: %s", vp_result.get("error"))
 
+    # The managed browser can disappear under us (window closed by the user,
+    # crash, reboot): agent-browser then fails with "Connection refused" on
+    # the stale CDP endpoint. Relaunch it once and retry instead of handing
+    # the model an error it can only work around.
+    if (
+        not _relaunched
+        and command not in ("close", "tab")
+        and not result.get("success")
+        and "connection refused" in str(result.get("error", "")).lower()
+        and _managed_browser_applies()
+    ):
+        logger.info("browser '%s': CDP endpoint refused - relaunching the managed browser and retrying", command)
+        try:
+            _ensure_managed_browser(task_id)
+            # The cached session still carries the dead endpoint, and the CDP
+            # supervisor is bound to it: repoint the one, restart the other.
+            fresh = _get_cdp_override()
+            with _cleanup_lock:
+                sess = _active_sessions.get(task_id)
+            if sess is not None and fresh:
+                sess["cdp_url"] = fresh
+            try:
+                from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
+                SUPERVISOR_REGISTRY.stop(task_id)
+            except Exception:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("managed browser relaunch failed: %s", exc)
+            return result
+        return _run_browser_command(task_id, command, args, timeout, _engine_override, _relaunched=True)
+
     return result
 
 
@@ -5006,16 +5054,29 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         ]
         title_lower = title.lower()
 
+        # Stealth / proxy advice only means something on a cloud provider.
+        # On the local persistent-profile browser it was pure noise ("upgrade
+        # your Browserbase plan", stealth_features: ["cdp_override"]) and it
+        # nudged the model toward raw CDP detours.
+        _cloud_backed = _get_cloud_provider() is not None and not session_info.get("features", {}).get("persistent_profile")
         if any(pattern in title_lower for pattern in blocked_patterns):
-            response["bot_detection_warning"] = (
-                f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
-                "Options: 1) Try adding delays between actions, 2) Access different pages first, "
-                "3) Enable advanced stealth (BROWSERBASE_ADVANCED_STEALTH=true, requires Scale plan), "
-                "4) Some sites have very aggressive bot detection that may be unavoidable."
-            )
+            if _cloud_backed:
+                response["bot_detection_warning"] = (
+                    f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
+                    "Options: 1) Try adding delays between actions, 2) Access different pages first, "
+                    "3) Enable advanced stealth (BROWSERBASE_ADVANCED_STEALTH=true, requires Scale plan), "
+                    "4) Some sites have very aggressive bot detection that may be unavoidable."
+                )
+            else:
+                response["bot_detection_warning"] = (
+                    f"Page title '{title}' suggests a bot check or CAPTCHA. Do not retry in a loop: "
+                    "wait, then try once more at a human pace. If a person must solve it, take a "
+                    "browser_vision screenshot, send it to the user (MEDIA:<screenshot_path>) and ask "
+                    "them to act - they may not be in front of this computer."
+                )
 
         # Include feature info on first navigation so model knows what's active
-        if is_first_nav and "features" in session_info:
+        if is_first_nav and "features" in session_info and _cloud_backed:
             features = session_info["features"]
             active_features = [k for k, v in features.items() if v]
             if not features.get("proxies"):
@@ -5028,9 +5089,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Auto-take a compact snapshot so the model can act immediately
         # without a separate browser_snapshot call.
         try:
-            snap_result = _run_browser_command(nav_session_key, "snapshot", ["-c"])
+            from tools.browser_tool_hermes import normalize_snapshot_data, snapshot_flags
+            snap_result = _run_browser_command(nav_session_key, "snapshot", snapshot_flags(baseline=True))
             if snap_result.get("success"):
-                snap_data = snap_result.get("data", {})
+                snap_data = normalize_snapshot_data(snap_result.get("data", {}))
                 snapshot_text = snap_data.get("snapshot", "")
                 refs = snap_data.get("refs", {})
                 threshold = get_browser_snapshot_threshold()
@@ -5054,7 +5116,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 def browser_snapshot(
     full: bool = False,
     task_id: Optional[str] = None,
-    user_task: Optional[str] = None
+    user_task: Optional[str] = None,
+    selector: Optional[str] = None,
+    interactive_only: bool = False,
+    depth: Optional[int] = None,
 ) -> str:
     """
     Get a text-based snapshot of the current page's accessibility tree.
@@ -5074,15 +5139,29 @@ def browser_snapshot(
 
     effective_task_id = _last_session_key(task_id or "default")
 
-    # Build command args based on full flag
-    args = []
-    if not full:
-        args.extend(["-c"])  # Compact mode
+    # Build command args. The default view (compact, whole page) also becomes
+    # the baseline that post-action observations diff against; a scoped or
+    # filtered view must not replace that baseline, so it is taken plain.
+    from tools.browser_tool_hermes import normalize_snapshot_data, snapshot_flags
+    scoped = bool(selector or interactive_only or depth)
+    if full:
+        args = snapshot_flags(compact=False)
+    else:
+        args = snapshot_flags(baseline=not scoped)
+    if selector:
+        args += ["-s", _normalize_ref(selector) if re.fullmatch(r"@?e\d+", selector.strip()) else selector.strip()]
+    if interactive_only:
+        args.append("-i")
+    if depth:
+        try:
+            args += ["-d", str(max(1, int(depth)))]
+        except (TypeError, ValueError):
+            pass
 
     result = _run_browser_command(effective_task_id, "snapshot", args)
 
     if result.get("success"):
-        data = result.get("data", {})
+        data = normalize_snapshot_data(result.get("data", {}))
         snapshot_text = data.get("snapshot", "")
         refs = data.get("refs", {})
 
@@ -5949,9 +6028,39 @@ def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
     )
 
 
-def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
+_EVAL_DEFAULT_TIMEOUT_S = 10.0
+_EVAL_MAX_TIMEOUT_S = 60.0
+
+
+def _active_tab_target_id(effective_task_id: str) -> Optional[str]:
+    """CDP targetId of the tab agent-browser is acting on (None if unknown).
+
+    Only needed when more than one tab is open: the supervisor's own page
+    session is bound to the tab that existed when it attached.
+    """
+    try:
+        res = _run_browser_command(effective_task_id, "tab", ["list"], timeout=10)
+        if not res.get("success"):
+            return None
+        tabs, _active = _normalize_tab_payload(res.get("data", {}), include_target_id=True)
+        if len(tabs) <= 1:
+            return tabs[0].get("target_id") if tabs else None
+        for t in tabs:
+            if t.get("active"):
+                return t.get("target_id")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("active tab lookup failed: %s", exc)
+    return None
+
+
+def _browser_eval(expression: str, task_id: Optional[str] = None, timeout: Optional[float] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
     effective_task_id = _last_session_key(task_id or "default")
+    try:
+        eval_timeout = float(timeout) if timeout is not None else _EVAL_DEFAULT_TIMEOUT_S
+    except (TypeError, ValueError):
+        eval_timeout = _EVAL_DEFAULT_TIMEOUT_S
+    eval_timeout = max(1.0, min(eval_timeout, _EVAL_MAX_TIMEOUT_S))
 
     if _eval_ssrf_guard_active(effective_task_id):
         blocked_literal = _expression_targets_private_url(expression)
@@ -5985,11 +6094,23 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     # spawning an ``agent-browser eval`` CLI process.  Falls through to the
     # subprocess path on any error so behaviour is unchanged when no
     # supervisor is running (e.g. plain agent-browser without a CDP backend).
+    # An iframe selected with browser_frame is agent-browser state the
+    # supervisor knows nothing about: evaluate through the CLI, which runs in
+    # the selected frame (hermes fork of agent-browser).
+    try:
+        from tools.browser_tool_hermes import frame_selected
+        _in_frame = bool(frame_selected(task_id or "default"))
+    except Exception:
+        _in_frame = False
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
-        supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
+        supervisor = None if _in_frame else SUPERVISOR_REGISTRY.get(effective_task_id)
         if supervisor is not None:
-            sup_result = supervisor.evaluate_runtime(expression)
+            sup_result = supervisor.evaluate_runtime(
+                expression,
+                target_id=_active_tab_target_id(effective_task_id),
+                timeout=eval_timeout,
+            )
             if sup_result.get("ok"):
                 raw_result = sup_result.get("result")
                 # Match the agent-browser path: if the value is a JSON string,
@@ -6027,6 +6148,11 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
             err = sup_result.get("error") or "evaluate_runtime failed"
             if "supervisor" not in err.lower():
                 # Real JS-side error — return it.
+                if err.startswith("TimeoutError"):
+                    err = (
+                        f"TimeoutError: the expression did not finish within {eval_timeout:g}s. "
+                        "Pass a larger `timeout` (max 60) for slow async work, or read less at once."
+                    )
                 return json.dumps({"success": False, "error": err}, ensure_ascii=False)
             # Supervisor-side failure (loop down, no session) — fall through.
             logger.debug(
@@ -6255,8 +6381,11 @@ def _normalize_download_path(path: Optional[str]) -> Path:
     return target
 
 
-def _normalize_tab_payload(data: Any) -> tuple[list[dict[str, Any]], Optional[int]]:
-    """Normalize browser tab listings to a stable Hermes shape."""
+def _normalize_tab_payload(data: Any, include_target_id: bool = False) -> tuple[list[dict[str, Any]], Optional[int]]:
+    """Normalize browser tab listings to a stable Hermes shape.
+
+    ``include_target_id`` keeps the CDP targetId (internal routing only; the
+    model addresses tabs by position or by the ``id`` handle)."""
     active_index: Optional[int] = None
     raw_tabs: Any = data
     if isinstance(data, dict):
@@ -6280,6 +6409,14 @@ def _normalize_tab_payload(data: Any) -> tuple[list[dict[str, Any]], Optional[in
                 "url": item.get("url") or item.get("href") or "",
                 "active": bool(item.get("active") or item.get("current") or item.get("selected")),
             }
+            # agent-browser >= 0.26 stable handle ("t2"); what switch/close send.
+            tab_handle = item.get("tabId") or item.get("tab_id") or item.get("id")
+            if tab_handle:
+                entry["id"] = str(tab_handle)
+            if item.get("label"):
+                entry["label"] = item["label"]
+            if include_target_id and item.get("targetId"):
+                entry["target_id"] = item["targetId"]
         else:
             entry = {
                 "index": pos,
@@ -6531,7 +6668,8 @@ def _camofox_browser_download(ref: str, path: Optional[str], task_id: Optional[s
     }, ensure_ascii=False)
 
 
-def browser_tab(action: str, index: Optional[int] = None, url: Optional[str] = None, task_id: Optional[str] = None) -> str:
+def browser_tab(action: str, index: Optional[int] = None, url: Optional[str] = None, task_id: Optional[str] = None,
+                tab_id: Optional[str] = None) -> str:
     """Manage browser tabs using a single multiplexed tool."""
     if _is_camofox_mode():
         return _camofox_browser_tab(action=action, index=index, url=url, task_id=task_id)
@@ -6542,58 +6680,104 @@ def browser_tab(action: str, index: Optional[int] = None, url: Optional[str] = N
 
     validated_index: Optional[int] = None
     if index is not None:
-        validated_index = int(index)
-    if action == "switch" and (validated_index is None or validated_index < 1):
-        return json.dumps({"success": False, "error": "browser_tab(action='switch') requires a 1-based index."}, ensure_ascii=False)
+        # Models sometimes pass the id ("t2") in `index`; accept it there too.
+        if isinstance(index, str) and not index.strip().isdigit():
+            tab_id = tab_id or index.strip()
+        else:
+            try:
+                validated_index = int(index)
+            except (TypeError, ValueError):
+                return json.dumps({"success": False, "error": f"Invalid tab index {index!r}."}, ensure_ascii=False)
+    if action == "switch" and tab_id is None and (validated_index is None or validated_index < 1):
+        return json.dumps({"success": False, "error": "browser_tab(action='switch') requires a 1-based index (see action='list')."}, ensure_ascii=False)
     if action == "close" and validated_index is not None and validated_index < 1:
         return json.dumps({"success": False, "error": "browser_tab(action='close') index must be >= 1."}, ensure_ascii=False)
 
     effective_task_id = _last_session_key(task_id or "default")
 
+    # agent-browser >= 0.26 addresses tabs by stable ids ("t2") or labels and
+    # rejects bare integers ("positional integers are not accepted").  The
+    # model keeps the simple 1-based position shown by action='list'; it is
+    # translated to the tab id from a fresh listing right before use, so a
+    # tab opened or closed in between cannot shift the target silently.
+    def _listing() -> tuple[Optional[list], Optional[int], Dict[str, Any]]:
+        res = _run_browser_command(effective_task_id, "tab", ["list"])
+        if not res.get("success"):
+            return None, None, res
+        tabs_, active_ = _normalize_tab_payload(res.get("data", {}))
+        return tabs_, active_, res
+
+    def _resolve(tabs_: list) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if tab_id:
+            wanted = str(tab_id).strip()
+            for t in tabs_:
+                if wanted in (t.get("id"), t.get("label")):
+                    return t, None
+            return None, f"No tab with id '{wanted}'. Open tabs: " + ", ".join(
+                f"{t['index']}={t.get('id')}" for t in tabs_)
+        if validated_index is None:
+            return None, None
+        if validated_index > len(tabs_):
+            return None, f"Tab index {validated_index} is out of range: {len(tabs_)} tab(s) open."
+        return tabs_[validated_index - 1], None
+
     if action == "list":
-        result = _run_browser_command(effective_task_id, "tab", ["list"])
-        if not result.get("success"):
+        tabs, active_index, result = _listing()
+        if tabs is None:
             response = {"success": False, "error": result.get("error", "Failed to list tabs")}
             return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
-        tabs, active_index = _normalize_tab_payload(result.get("data", {}))
         response = {"success": True, "tabs": tabs, "active_index": active_index}
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
     if action == "new":
-        create_result = _run_browser_command(effective_task_id, "tab", ["new"])
+        create_result = _run_browser_command(effective_task_id, "tab", ["new"] + ([url] if url else []),
+                                             timeout=max(_get_command_timeout(), 60) if url else None)
         if not create_result.get("success"):
             response = {"success": False, "error": create_result.get("error", "Failed to create new tab")}
             return json.dumps(_copy_fallback_warning(response, create_result), ensure_ascii=False)
-        if url:
-            nav_result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
-            if not nav_result.get("success"):
-                response = {"success": False, "error": nav_result.get("error", f"Failed to navigate new tab to {url}")}
-                return json.dumps(_copy_fallback_warning(response, nav_result), ensure_ascii=False)
-            response = {"success": True, "action": "new", "url": url}
-            return json.dumps(_copy_fallback_warning(response, nav_result), ensure_ascii=False)
+        tabs, active_index, _ = _listing()
         response = {"success": True, "action": "new"}
+        if url:
+            response["url"] = url
+        if tabs:
+            response["active_index"] = active_index
+            response["tab_count"] = len(tabs)
         return json.dumps(_copy_fallback_warning(response, create_result), ensure_ascii=False)
 
+    tabs, active_index, list_result = _listing()
+    if tabs is None:
+        response = {"success": False, "error": list_result.get("error", "Failed to list tabs")}
+        return json.dumps(_copy_fallback_warning(response, list_result), ensure_ascii=False)
+    target, err = _resolve(tabs)
+    if err:
+        return json.dumps({"success": False, "error": err, "tabs": tabs}, ensure_ascii=False)
+
     if action == "switch":
-        result = _run_browser_command(effective_task_id, "tab", [str(validated_index)])
+        result = _run_browser_command(effective_task_id, "tab", [target["id"]])
         if not result.get("success"):
-            response = {"success": False, "error": result.get("error", f"Failed to switch to tab {validated_index}")}
+            response = {"success": False, "error": result.get("error", f"Failed to switch to tab {target['index']}")}
             return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
-        response = {"success": True, "action": "switch", "active_index": validated_index}
+        response = {"success": True, "action": "switch", "active_index": target["index"],
+                    "title": target.get("title", ""), "url": target.get("url", "")}
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
     close_args = ["close"]
-    if validated_index is not None:
-        close_args.append(str(validated_index))
+    if target is not None:
+        close_args.append(target["id"])
     result = _run_browser_command(effective_task_id, "tab", close_args)
     if not result.get("success"):
         response = {"success": False, "error": result.get("error", "Failed to close tab")}
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
     response = {"success": True, "action": "close"}
-    if validated_index is not None:
-        response["closed_index"] = validated_index
+    if target is not None:
+        response["closed_index"] = target["index"]
+        response["closed_title"] = target.get("title", "")
     else:
         response["closed_active"] = True
+    remaining, remaining_active, _ = _listing()
+    if remaining is not None:
+        response["active_index"] = remaining_active
+        response["tabs"] = remaining
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
@@ -6856,12 +7040,12 @@ def browser_download(ref: str, path: Optional[str] = None, task_id: Optional[str
     return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_eval(expression: str, task_id: Optional[str] = None) -> str:
+def browser_eval(expression: str, task_id: Optional[str] = None, timeout: Optional[float] = None) -> str:
     """Evaluate JavaScript in the page (SSRF-guarded via _browser_eval)."""
     if not expression or not expression.strip():
         return json.dumps({"success": False, "error": "Empty expression"},
                           ensure_ascii=False)
-    return _browser_eval(expression, task_id)
+    return _browser_eval(expression, task_id, timeout=timeout)
 
 
 def browser_pdf(path: Optional[str] = None, task_id: Optional[str] = None) -> str:
@@ -8266,7 +8450,9 @@ registry.register(
         "browser_snapshot",
         args,
         fallback=lambda: browser_snapshot(
-            full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
+            full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task"),
+            selector=args.get("selector") or args.get("ref"),
+            interactive_only=bool(args.get("interactive_only")), depth=args.get("depth")),
         **_browser_router_kw(kw),
     ),
     check_fn=check_browser_snapshot_requirements,
@@ -8415,6 +8601,7 @@ registry.register(
         index=args.get("index"),
         url=args.get("url"),
         task_id=kw.get("task_id"),
+        tab_id=args.get("tab_id"),
     ),
     check_fn=check_browser_requirements,
     emoji="🗂️",
@@ -8464,6 +8651,7 @@ registry.register(
     handler=lambda args, **kw: browser_eval(
         expression=args.get("expression", ""),
         task_id=kw.get("task_id"),
+        timeout=args.get("timeout"),
     ),
     check_fn=check_browser_requirements,
     emoji="🧪",
