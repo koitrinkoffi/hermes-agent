@@ -734,7 +734,8 @@ _MAX_BASE64_BYTES = 20 * 1024 * 1024
 # keeps a 1568px screenshot cheap enough to ride the session (PNGs that
 # exceed it are downscaled further by the byte-budget ladder), well under
 # every provider's per-image limit.
-_EMBED_TARGET_BYTES = 256 * 1024
+_EMBED_TARGET_BYTES = 256 * 1024  # default only; the live budget is vision.embed_target_bytes
+from tools.vision_tools_history_budget import resolve_embed_target_bytes as _resolve_embed_target_bytes  # noqa: E402
 
 # Proactive embed dimension cap (px, longest side).  Anthropic still rejects
 # above 8000px independently of the byte cap, but its tokenizer downsamples
@@ -1386,7 +1387,8 @@ async def _vision_analyze_native(
         # still rejects >5 MB / >8000px with a non-retryable 400, but those
         # are one-shot viewing limits — history embeds are sized smaller so
         # repeated vision_analyze turns don't blow the context (#92699).
-        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+        _embed_target_bytes = _resolve_embed_target_bytes()
+        _over_bytes = len(image_data_url) > _embed_target_bytes
         _over_dims = await _run_encode_on_cpu_executor(
             _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
         )
@@ -1394,7 +1396,7 @@ async def _vision_analyze_native(
             image_data_url = await _run_encode_on_cpu_executor(
                 _resize_image_for_vision,
                 temp_image_path, mime_type=detected_mime_type,
-                max_base64_bytes=_EMBED_TARGET_BYTES,
+                max_base64_bytes=_embed_target_bytes,
                 max_dimension=_EMBED_MAX_DIMENSION,
                 scale_out=_scale_info,
                 force_jpeg=True,

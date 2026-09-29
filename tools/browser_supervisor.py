@@ -37,6 +37,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Browserbase can transiently drop a CDP socket while a short-lived client
+# reconnects.  A locally owned browser endpoint, however, is gone for good
+# once its process exits; leave enough room for the former without leaking a
+# supervisor thread and warnings forever for the latter.  (Ported from
+# upstream 67b061a51c + aefa503479.)
+MAX_POST_ATTACH_RECONNECT_FAILURES = 5
+
+
+def _loopback_connect_kwargs(url: str) -> Dict[str, Any]:
+    """``proxy=None`` for loopback endpoints when websockets honours env proxies.
+
+    websockets >= 15 routes connections through HTTP(S)_PROXY by default; a
+    local CDP endpoint must never go through a proxy.
+    """
+    try:
+        import inspect
+        from urllib.parse import urlparse
+        import websockets
+        if (urlparse(url).hostname or "") not in ("127.0.0.1", "localhost", "::1"):
+            return {}
+        if "proxy" in inspect.signature(websockets.connect).parameters:
+            return {"proxy": None}
+    except Exception:
+        pass
+    return {}
+
 
 def _redact_cdp_error_text(exc: object) -> str:
     """Redact any CDP endpoint credentials from an error's string form.
@@ -678,6 +704,21 @@ class CDPSupervisor:
             with self._state_lock:
                 self._active = False
 
+    def _reconnect_budget_spent(self, failures: int, e: BaseException) -> bool:
+        """True once ``failures`` consecutive post-attach reconnects failed.
+
+        Logs ONE final line and drops this supervisor from the registry so a
+        dead endpoint (the browser exited) leaves neither a retrying thread nor
+        a stale registry entry; the next browser call starts a fresh one.
+        """
+        if failures < MAX_POST_ATTACH_RECONNECT_FAILURES:
+            return False
+        logger.warning("CDP supervisor %s: stopped after %s failed reconnect attempts: %s",
+                       self.task_id, failures, _redact_cdp_error_text(e))
+        if SUPERVISOR_REGISTRY.get(self.task_id) is self:
+            SUPERVISOR_REGISTRY._pop(self.task_id)
+        return True
+
     async def _run(self) -> None:
         """Top-level supervisor coroutine.
 
@@ -687,26 +728,30 @@ class CDPSupervisor:
         CDP client) disconnects.  We drop our state snapshot keys that
         depend on specific CDP session ids, re-attach, and keep going.
         """
-        attempt = 0
+        reconnect_failures = 0
         last_success_at = 0.0
         backoff = 0.5
         import websockets  # deferred: only supervisors that connect pay the import
         while not self._stop_requested:
             try:
                 self._ws = await asyncio.wait_for(
-                    websockets.connect(self.cdp_url, max_size=50 * 1024 * 1024),
+                    websockets.connect(self.cdp_url, max_size=50 * 1024 * 1024,
+                                       **_loopback_connect_kwargs(self.cdp_url)),
                     timeout=10.0,
                 )
             except Exception as e:
-                attempt += 1
                 if not self._ready_event.is_set():
                     # Never connected once — fatal for start().
                     self._start_error = e
                     self._ready_event.set()
                     return
+                reconnect_failures += 1
+                if self._reconnect_budget_spent(reconnect_failures, e):
+                    return
                 logger.warning(
-                    "CDP supervisor %s: connect failed (attempt %s): %s",
-                    self.task_id, attempt, _redact_cdp_error_text(e),
+                    "CDP supervisor %s: connect failed (attempt %s/%s): %s",
+                    self.task_id, reconnect_failures, MAX_POST_ATTACH_RECONNECT_FAILURES,
+                    _redact_cdp_error_text(e),
                 )
                 await asyncio.sleep(min(backoff, 10.0))
                 backoff = min(backoff * 2, 10.0)
@@ -730,6 +775,7 @@ class CDPSupervisor:
                 with self._state_lock:
                     self._active = True
                 last_success_at = time.time()
+                reconnect_failures = 0
                 backoff = 0.5  # reset after a successful attach
                 if not self._ready_event.is_set():
                     self._ready_event.set()
@@ -741,10 +787,14 @@ class CDPSupervisor:
                     self._start_error = e
                     self._ready_event.set()
                     raise
+                reconnect_failures += 1
+                if self._reconnect_budget_spent(reconnect_failures, e):
+                    return
                 logger.warning(
-                    "CDP supervisor %s: session dropped after %.1fs: %s",
+                    "CDP supervisor %s: session dropped after %.1fs (attempt %s/%s): %s",
                     self.task_id,
                     time.time() - last_success_at,
+                    reconnect_failures, MAX_POST_ATTACH_RECONNECT_FAILURES,
                     _redact_cdp_error_text(e),
                 )
             finally:
@@ -1524,6 +1574,11 @@ class _SupervisorRegistry:
                 return already
             self._by_task[task_id] = supervisor
         return supervisor
+
+    def _pop(self, task_id: str) -> None:
+        """Forget a supervisor without stopping it (it is already exiting)."""
+        with self._lock:
+            self._by_task.pop(task_id, None)
 
     def stop(self, task_id: str) -> None:
         """Stop and discard the supervisor for ``task_id`` if it exists."""

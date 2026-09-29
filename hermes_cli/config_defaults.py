@@ -596,6 +596,14 @@ DEFAULT_CONFIG = {
         "cache_exempt_hosts": [],
     },
 
+    # Native vision embeds (vision_analyze / browser screenshots on vision-capable main models) ride
+    # conversation history and are re-sent on every later API call.
+    "vision": {
+        # Byte budget for one embedded image (clamped 64 KiB..4 MiB). Raise it for dense
+        # screenshots of tables the model calls "unreadable" at 256 KB. (upstream f37336522b)
+        "embed_target_bytes": 256 * 1024,
+    },
+
     "browser": {
         # Browser tool implementation.
         # ""            — DEFAULT: Browser Use mode when the browser-use CLI

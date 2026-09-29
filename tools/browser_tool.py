@@ -143,7 +143,34 @@ def _build_browser_env() -> dict:
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
+    _bypass_proxy_for_loopback(env)
     return env
+
+
+_LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
+
+
+def _bypass_proxy_for_loopback(env: dict) -> None:
+    """Keep loopback CDP dials off any HTTP(S) proxy set in the environment.
+
+    The managed browser listens on 127.0.0.1; a system proxy variable would
+    otherwise route agent-browser's CDP discovery through the proxy and fail
+    ("did not receive a valid HTTP response").  No-op when no proxy is set,
+    and ``NO_PROXY=*`` is left as is.  (Minimal port of upstream
+    00a68a8768 / 8f6f92d901 / 95987fb85a.)
+    """
+    if not any(env.get(k) for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                                     "http_proxy", "https_proxy", "all_proxy")):
+        return
+    for key in ("NO_PROXY", "no_proxy"):
+        current = env.get(key, "")
+        if current.strip() == "*":
+            continue
+        entries = [e.strip() for e in current.split(",") if e.strip()]
+        for host in _LOOPBACK_NO_PROXY:
+            if host not in entries:
+                entries.append(host)
+        env[key] = ",".join(entries)
 
 try:
     from tools.website_policy import check_website_access
@@ -2759,6 +2786,13 @@ def _write_owner_pid(socket_dir: str, session_name: str) -> None:
                      session_name, exc)
 
 
+def _argv_token_is_path(token: str, path: str) -> bool:
+    """True when ``token`` (or its ``--flag=VALUE`` value) names exactly ``path``."""
+    want = os.path.normpath(path).lower()
+    candidate = token.split("=", 1)[1] if token.startswith("-") and "=" in token else token
+    return bool(candidate) and os.path.normpath(candidate).lower() == want
+
+
 def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
                                     session_name: str) -> bool:
     """Confirm a live PID is genuinely *this* session's agent-browser daemon.
@@ -2801,7 +2835,8 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
     try:
         proc = psutil.Process(daemon_pid)
         name = (proc.name() or "").lower()
-        cmdline = " ".join(proc.cmdline() or []).lower()
+        argv = list(proc.cmdline() or [])
+        cmdline = " ".join(argv).lower()
     except psutil.NoSuchProcess:
         # Vanished between the liveness check and now — nothing to reap.
         return False
@@ -2819,11 +2854,12 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
             "process (name=%r)", daemon_pid, session_name, name)
         return False
 
-    # Binding check: the live process must reference *this* socket dir.
-    socket_dir_l = socket_dir.lower()
-    socket_base_l = os.path.basename(socket_dir).lower()
-    bound = socket_dir_l in cmdline or (
-        socket_base_l and socket_base_l in cmdline)
+    # Binding check: the live process must reference *this* socket dir as a
+    # FULL path argv token (bare or --flag=path), never a substring: the dir
+    # basename is predictable (agent-browser-<session>), so a recycled PID
+    # running e.g. `grep agent-browser-h_x ...` passed the old basename check.
+    # (Ported from upstream f2f70bed7a.)
+    bound = any(_argv_token_is_path(tok, socket_dir) for tok in argv)
     if not bound:
         try:
             env_dir = (proc.environ() or {}).get(
@@ -7454,11 +7490,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # turn — no aux call, no information loss. Consistent with vision_analyze.
         from tools.vision_tools import (
             _EMBED_MAX_DIMENSION,
-            _EMBED_TARGET_BYTES,
             _build_native_vision_tool_result,
             _resize_image_for_vision,
             _should_use_native_vision_fast_path,
         )
+        from tools.vision_tools_history_budget import resolve_embed_target_bytes
 
         if _should_use_native_vision_fast_path():
             # History-reuse cap (#92699): this embed is baked into the tool
@@ -7474,7 +7510,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             data_url = _resize_image_for_vision(
                 screenshot_path,
                 mime_type="image/png",
-                max_base64_bytes=_EMBED_TARGET_BYTES,
+                max_base64_bytes=resolve_embed_target_bytes(),
                 max_dimension=_EMBED_MAX_DIMENSION,
                 force_jpeg=True,
             )
