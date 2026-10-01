@@ -169,6 +169,15 @@ _recent_subagents: Dict[str, Dict[str, Any]] = {}
 # as a failure.
 SUBAGENT_FAILURE_STATUSES = frozenset({"failed", "error", "timeout"})
 
+# Local mod: failure_reason values (agent.error_classifier.FailoverReason)
+# that mean "the provider could not serve", as opposed to a task-level
+# failure. Only these trigger an agent type's `fallback: inherit`.
+_PROVIDER_FAILURE_REASONS = frozenset({
+    "auth", "auth_permanent", "billing", "billing_unverified",
+    "rate_limit", "upstream_rate_limit", "overloaded", "server_error",
+    "timeout", "model_not_found",
+})
+
 
 def _clean_error_text(error: Any, max_chars: int = 200) -> str:
     """Reduce an arbitrary error payload to one clean human-readable line.
@@ -1237,6 +1246,9 @@ def check_delegate_requirements() -> bool:
 #   sync:  true → the dispatch runs this delegation synchronously and the
 #          child's text IS the tool result (no background handle).
 #   model: default model id for this type; a per-call `model` still wins.
+#   fallback: 'inherit' → when the pinned provider fails (402/429/5xx/
+#          timeout/auth), the task is re-run once on the session model and
+#          the result says so. Absent = fail loudly (upstream behaviour).
 # The body REPLACES the generic child scaffold entirely: it becomes the
 # child's whole system prompt, followed only by YOUR TASK / CONTEXT.
 def _load_agent_type(name: str) -> Dict[str, Any]:
@@ -1278,11 +1290,18 @@ def _load_agent_type(name: str) -> Dict[str, Any]:
             f"agent_type {name!r}: 'tools' must be 'none' or a list of toolsets"
         )
     model = meta.get("model")
+    fallback = meta.get("fallback")
+    fallback = str(fallback).strip().lower() if fallback else None
+    if fallback not in (None, "inherit"):
+        raise ValueError(
+            f"agent_type {name!r}: 'fallback' must be 'inherit' or absent"
+        )
     return {
         "name": name,
         "tools": tools,  # None = inherit parent, 'none' = no tools, list = whitelist
         "sync": bool(meta.get("sync", False)),
         "model": str(model).strip() if model else None,
+        "fallback": fallback,
         "prompt": body.strip(),
     }
 
@@ -4310,8 +4329,7 @@ def delegate_task(
     # resolved tool names around each construction under a lock, so child
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
-    children = []
-    for i, t in enumerate(task_list):
+    def _build_child_for(i, t, t_creds):
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -4325,36 +4343,30 @@ def delegate_task(
             _child_context = append_output_contract(_child_context, _task_schema)
         # Local mod: per-task credentials — `creds` unless this task overrode
         # the model (per-task 'model' > top-level 'model' > agent type default).
-        t_creds = task_creds[i]
-        try:
-            child = _build_child_preserving_parent_tools(
-                task_index=i,
-                goal=t["goal"],
-                context=_child_context,
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                # Local mod: an agent_type MAY restrict them (whitelist/'none')
-                # via agent_type_def — restriction only, never widening.
-                toolsets=None,
-                agent_type_def=task_types[i],
-                model=t_creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=t_creds["provider"],
-                override_base_url=t_creds["base_url"],
-                override_api_key=t_creds["api_key"],
-                override_api_mode=t_creds["api_mode"],
-                override_request_overrides=t_creds.get("request_overrides"),
-                override_max_tokens=t_creds.get("max_output_tokens"),
-                override_acp_command=t_creds.get("command"),
-                override_acp_args=t_creds.get("args"),
-                role=effective_role,
-            )
-        except ValueError as exc:
-            # Explicit-pin preflight failures (e.g. pinned delegation.command
-            # missing from PATH) refuse the spawn loudly (#80450).
-            return tool_error(str(exc))
+        child = _build_child_preserving_parent_tools(
+            task_index=i,
+            goal=t["goal"],
+            context=_child_context,
+            # Subagents always inherit the parent's toolsets; the model
+            # cannot choose or narrow them (no model-facing toolsets arg).
+            # Local mod: an agent_type MAY restrict them (whitelist/'none')
+            # via agent_type_def — restriction only, never widening.
+            toolsets=None,
+            agent_type_def=task_types[i],
+            model=t_creds["model"],
+            max_iterations=effective_max_iter,
+            task_count=n_tasks,
+            parent_agent=parent_agent,
+            override_provider=t_creds["provider"],
+            override_base_url=t_creds["base_url"],
+            override_api_key=t_creds["api_key"],
+            override_api_mode=t_creds["api_mode"],
+            override_request_overrides=t_creds.get("request_overrides"),
+            override_max_tokens=t_creds.get("max_output_tokens"),
+            override_acp_command=t_creds.get("command"),
+            override_acp_args=t_creds.get("args"),
+            role=effective_role,
+        )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:
@@ -4380,6 +4392,16 @@ def delegate_task(
             _ident_ref = getattr(child, "_progress_identity_ref", None)
             if isinstance(_ident_ref, dict):
                 _ident_ref["delegation_id"] = live_deleg_id
+        return child
+
+    children = []
+    for i, t in enumerate(task_list):
+        try:
+            child = _build_child_for(i, t, task_creds[i])
+        except ValueError as exc:
+            # Explicit-pin preflight failures (e.g. pinned delegation.command
+            # missing from PATH) refuse the spawn loudly (#80450).
+            return tool_error(str(exc))
         children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
@@ -4546,6 +4568,58 @@ def delegate_task(
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
+
+        # Local mod: agent types declaring `fallback: inherit` get ONE re-run
+        # on the session model when their pinned provider failed for a
+        # provider-side reason. Sequential, after the batch joined.
+        for pos, entry in enumerate(list(results)):
+            idx = entry.get("task_index")
+            ttype = task_types[idx] if isinstance(idx, int) and idx < len(task_types) else None
+            if not ttype or ttype.get("fallback") != "inherit":
+                continue
+            if task_creds[idx] is creds:
+                continue  # already on the session model, nothing to fall back to
+            if entry.get("status") not in SUBAGENT_FAILURE_STATUSES:
+                continue
+            reason = entry.get("failure_reason")
+            if reason not in _PROVIDER_FAILURE_REASONS:
+                continue
+            if (
+                honor_parent_interrupt
+                and getattr(parent_agent, "_interrupt_requested", False) is True
+            ):
+                break
+            pinned = task_creds[idx].get("model") or "pinned model"
+            t = task_list[idx]
+            try:
+                fb_child = _build_child_for(idx, t, creds)
+            except ValueError as exc:
+                logger.warning("agent_type fallback build failed for task %d: %s", idx, exc)
+                continue
+            logger.info(
+                "agent_type %s: %s failed (%s), re-running task %d on the session model",
+                ttype.get("name"), pinned, reason, idx,
+            )
+            fb_entry = _run_single_child(
+                idx,
+                t["goal"],
+                fb_child,
+                parent_agent,
+                owner_session_id=_origin_ui_session_id or None,
+                owner_transport=_origin_owner_transport,
+                owner_session_record=_origin_owner_session_record,
+            )
+            note = (
+                f"[{pinned} unavailable ({reason}); this task was re-run "
+                "locally on the session model]"
+            )
+            summary = fb_entry.get("summary")
+            fb_entry["summary"] = f"{note}\n\n{summary}" if summary else note
+            fb_entry["fallback_from"] = {"model": pinned, "failure_reason": reason}
+            results[pos] = fb_entry
+            for c_pos, (c_i, c_t, _c) in enumerate(children):
+                if c_i == idx:
+                    children[c_pos] = (c_i, c_t, fb_child)
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's
