@@ -796,6 +796,134 @@ def _truncate_with_footer(
     return model_text, True
 
 
+# ── Local mod (hermes-mods): auxiliary summarization for the main agent ──
+# Upstream #54843 dropped the LLM summarizer. This brings it back for the
+# top-level agent only: a page over SUMMARY_MIN_CHARS is summarized by the
+# auxiliary.web_extract model and the full text is stored on disk, so the
+# main context gets ~5k chars instead of up to 15k. Subagents keep the raw
+# truncate-and-store path (their context is throwaway, and their job is to
+# read the source itself). The call goes straight to the configured client:
+# async_call_llm's capacity fallback would silently summarize on the main
+# model instead, which is slower than just returning the raw page.
+# Kill switch: web.extract_summarize: false.
+SUMMARY_MIN_CHARS = 5000
+SUMMARY_MAX_CHARS = 5000
+# Above this, a single summarization call is not worth the latency/credits;
+# the raw truncate path (with its stored full text) is used instead.
+SUMMARY_MAX_INPUT_CHARS = 400_000
+
+_SUMMARY_SYSTEM_PROMPT = (
+    "You are an expert content analyst. You turn one web page into a compact, "
+    "faithful markdown digest that replaces the page in another model's context.\n"
+    "Rules:\n"
+    "1. Keep every key fact, figure, date, price, name and condition, with its "
+    "original wording when precision matters. Quote short passages and code verbatim.\n"
+    "2. Never add, infer or complete anything the page does not state.\n"
+    "3. Write in the page's own language.\n"
+    f"4. Stay under {SUMMARY_MAX_CHARS - 500:,} characters. Use headers and bullets; "
+    "no introduction, no conclusion."
+)
+
+
+def _summarize_enabled() -> bool:
+    value = _load_web_config().get("extract_summarize", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _is_subagent_task(task_id: Optional[str]) -> bool:
+    try:
+        from tools.delegate_tool import get_subagent_attribution
+        return get_subagent_attribution(task_id) is not None
+    except Exception:  # noqa: BLE001 — unknown means "not a child"
+        return False
+
+
+def _summary_error_label(exc: Exception) -> str:
+    status = getattr(exc, "status_code", None)
+    if status:
+        return f"HTTP {status}"
+    return type(exc).__name__
+
+
+async def _summarize_page(content: str, url: str, title: str) -> tuple[Optional[str], str]:
+    """Return (summary, model) on success or (None, error_label) on failure.
+
+    One retry, only for rate limits / timeouts / connection drops. A 402
+    (free credits exhausted, model not in the plan) fails at once.
+    """
+    from agent.auxiliary_client import (
+        _get_task_timeout,
+        get_async_text_auxiliary_client,
+    )
+
+    try:
+        client, model = get_async_text_auxiliary_client("web_extract")
+    except Exception as exc:  # noqa: BLE001
+        return None, _summary_error_label(exc)
+    if client is None or not model:
+        return None, "no auxiliary model configured"
+
+    header = f"URL: {url}\n" + (f"Title: {title}\n" if title else "")
+    messages = [
+        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": f"{header}\nPAGE CONTENT:\n{content}"},
+    ]
+    timeout = _get_task_timeout("web_extract")
+    last_error = "unknown error"
+    for attempt in range(2):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=2500,
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = _summary_error_label(exc)
+            status = getattr(exc, "status_code", None)
+            retryable = status == 429 or status is None or status >= 500
+            if attempt == 0 and retryable:
+                await asyncio.sleep(2)
+                continue
+            return None, last_error
+        try:
+            text = (response.choices[0].message.content or "").strip()
+        except (AttributeError, IndexError):
+            text = ""
+        if text:
+            if len(text) > SUMMARY_MAX_CHARS:
+                text = text[:SUMMARY_MAX_CHARS] + "\n\n[... summary truncated ...]"
+            return text, model
+        last_error = "empty response"
+    return None, last_error
+
+
+async def _summarize_with_footer(content: str, url: str, title: str) -> tuple[Optional[str], str]:
+    """Return (model_text, model) or (None, error_label)."""
+    if len(content) > SUMMARY_MAX_INPUT_CHARS:
+        return None, f"page too large to summarize ({len(content):,} chars)"
+    summary, model_or_error = await _summarize_page(content, url, title)
+    if summary is None:
+        return None, model_or_error
+    stored_path = _store_full_text(url, content)
+    footer_lines = [
+        "",
+        "─" * 8 + " [SUMMARIZED] " + "─" * 8,
+        f"Summary by {model_or_error} of {len(content):,} clean characters. "
+        "It can miss details.",
+    ]
+    if stored_path:
+        footer_lines.append(f"Full text saved to: {stored_path}")
+        footer_lines.append(
+            f'To check a detail: read_file path="{stored_path}" offset=1 limit=200'
+        )
+    footer_lines.append("─" * 30)
+    return summary + "\n" + "\n".join(footer_lines), model_or_error
+
+
 
 # ─── Exa / Parallel inline helpers — moved into plugins ──────────────────────
 # After PR #25182, the exa client + search/extract and parallel client +
@@ -1049,9 +1177,16 @@ async def web_extract_tool(
     urls: List[Any],
     format: str = None,
     char_limit: Optional[int] = None,
+    summarize: bool = False,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.
+
+    Local mod (hermes-mods): with ``summarize=True`` (the registry handler sets
+    it for the top-level agent when web.extract_summarize is on), pages over
+    SUMMARY_MIN_CHARS are replaced by an auxiliary-model summary, one page at
+    a time; on any summarizer failure the page falls back to the raw path
+    below with a one-line notice.
 
     Returns clean page content (markdown/text) with NO LLM summarization. The
     extract backends (Firecrawl, Tavily, Exa, Parallel, Keenable) already return clean,
@@ -1432,7 +1567,23 @@ async def web_extract_tool(
             if not raw_content:
                 continue
             clean = convert_base64_images_to_links(raw_content)
+            summary_failure = None
+            if summarize and len(clean) > SUMMARY_MIN_CHARS:
+                # Sequential on purpose: the Ollama Cloud free plan allows
+                # one concurrent request.
+                summarized, model_or_error = await _summarize_with_footer(
+                    clean, url, result.get("title", "")
+                )
+                if summarized is not None:
+                    result["content"] = summarized
+                    debug_call_data["processing_applied"].append("llm_summary")
+                    logger.info("%s (summarized %d chars by %s)", url, len(clean), model_or_error)
+                    continue
+                summary_failure = model_or_error
+                logger.info("%s summary unavailable (%s); raw fallback", url, model_or_error)
             model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            if summary_failure:
+                model_text += f"\n[summary unavailable ({summary_failure}); raw page returned]"
             result["content"] = model_text
             if truncated:
                 debug_call_data["pages_truncated"] += 1
@@ -1676,7 +1827,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
+    "description": "Extract content from web page URLs. Returns clean page content in markdown/text. In some sessions, pages over 5000 chars come back as a summary with a [SUMMARIZED] footer giving the full text's saved path; pass char_limit to get the raw page instead. Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1714,6 +1865,13 @@ registry.register(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
         "markdown",
         char_limit=args.get("char_limit"),
+        # Local mod (hermes-mods): summarize for the top-level agent only,
+        # and never when the model explicitly asked for a raw char budget.
+        summarize=(
+            args.get("char_limit") is None
+            and _summarize_enabled()
+            and not _is_subagent_task(kw.get("task_id"))
+        ),
     ),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
